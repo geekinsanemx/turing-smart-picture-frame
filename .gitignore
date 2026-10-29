@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# picture_frame runtime files
+log.log
+screencap.png
+tmp
+.images/
+images/
+bkp/
