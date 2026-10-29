@@ -89,7 +89,7 @@ Configuration:
 Usage:
 1. Place images in the 'images' directory (or specify custom path with --images)
 2. Run script: python3 turing-smart-picture-frame.py [options]
-   or, once installed with 'pip install --user .': turing-smart-picture-frame [options]
+   or, once installed with 'pipx install .': turing-smart-picture-frame [options]
 3. Press Ctrl+C to exit gracefully
 
 Image Requirements:
@@ -98,8 +98,11 @@ Image Requirements:
 - Will be automatically resized and formatted for display (see --scale-mode)
 
 Notes:
-- To run from any folder, install the project with 'pip install --user .' instead of copying
-  library/ into site-packages; the 'turing-smart-picture-frame' command is installed into ~/.local/bin
+- To run from any folder, install the project with 'pipx install .' instead of copying
+  library/ into site-packages; the 'turing-smart-picture-frame' command is installed into ~/.local/bin.
+  'pip install --user .' fails on distributions with an externally managed Python (PEP 668, e.g. Debian 12)
+- Requirements: Python 3.9+, read/write access to the serial port (Linux: 'dialout' group) and a valid
+  locale (library/log.py calls locale.setlocale(LC_ALL, ''))
 - Text overlay uses the bundled font res/fonts/dejavu/DejaVuSans-Bold.ttf (see LICENSE.txt there)
   unless --font is given (bundled name, see --font-list, or path to a custom font)
 - Processed images are cached in $XDG_CACHE_HOME/tspf (default ~/.cache/tspf), named by the hash of

@@ -22,21 +22,36 @@ The display communication code in `library/` comes from [turing-smart-screen-pyt
 | `D` | Kipye Qiye Smart Display 3.5" |
 | `SIMU` | Simulated display, served at `http://localhost:5678` |
 
+## Requirements
+
+| Requirement | Why |
+|---|---|
+| Python 3.9+ | `requires-python` in `pyproject.toml` |
+| [pipx](https://pipx.pypa.io/) or `python3-venv` | Debian 12+, Ubuntu 23.04+ and other distributions mark the system Python as externally managed ([PEP 668](https://peps.python.org/pep-0668/)), so `pip install --user` fails with `externally-managed-environment` |
+| Access to the serial port | On Linux the display is `/dev/ttyACM*`, owned by the `dialout` group: `sudo usermod -aG dialout $USER`, then log in again |
+| A valid locale | `library/log.py` calls `locale.setlocale(LC_ALL, '')`, which fails if `LANG`/`LC_*` name a locale that is not generated (`locale -a` lists the available ones) |
+
+Python packages (`pyserial`, `Pillow`, `numpy`) are installed automatically. On Linux x86_64/arm64 they come as prebuilt wheels that already include freetype, libjpeg and zlib. On platforms without wheels (e.g. 32-bit ARM), pip builds Pillow and needs `libjpeg-dev`, `zlib1g-dev` and `libfreetype-dev`. Fonts are bundled, no system fonts are needed.
+
 ## Installation
 
-Requires Python 3.9+.
-
-Install as a command (`turing-smart-picture-frame` is placed in `~/.local/bin`, which must be in `PATH`):
+Install as a command with [pipx](https://pipx.pypa.io/) (isolated environment, `turing-smart-picture-frame` placed in `~/.local/bin`):
 
 ```bash
-pip install --user .
+sudo apt install pipx    # Debian/Ubuntu; other systems: see pipx docs
+pipx ensurepath          # adds ~/.local/bin to PATH if needed (open a new terminal afterwards)
+pipx install .
+turing-smart-picture-frame --font-list
 ```
 
-Or run from the repository without installing:
+Update after `git pull` or after changing the defaults in the code: `pipx install --force .`
+
+Or run from the repository without installing, in a virtual environment:
 
 ```bash
-pip install -r requirements.txt
-python3 turing-smart-picture-frame.py
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python turing-smart-picture-frame.py --images ~/Pictures
 ```
 
 ## Usage
@@ -82,7 +97,7 @@ turing-smart-picture-frame --images ~/Pictures --font ~/fonts/MyFont.ttf
 
 Supported formats: PNG, JPG/JPEG, BMP, GIF. Press Ctrl+C to exit.
 
-Defaults are set at the top of `turing_smart_picture_frame.py`: `COM_PORT`, `REVISION`, `IMAGE_ROTATION_INTERVAL`, `PRELOAD_IMAGES`, `BRIGHTNESS`, `CACHE_DIR`, `CACHE_SIZE_MB`, `TIME_STYLE`/`DATE_STYLE`/`DAY_STYLE` (size, color on dark and on light backgrounds), `TEXT_CONTRAST`, `OUTLINE_WIDTH`, `BOX_ALPHA`, `SCALE_MODE`, `MAX_CROP`, `MIN_COVERAGE`, `BLUR_RADIUS`, `BLUR_BRIGHTNESS`, `OVERLAY_MARGIN`, `OVERLAY_LINE_GAP`, `WIDTH`/`HEIGHT`. When installed, re-run `pip install --user .` after changing them.
+Defaults are set at the top of `turing_smart_picture_frame.py`: `COM_PORT`, `REVISION`, `IMAGE_ROTATION_INTERVAL`, `PRELOAD_IMAGES`, `BRIGHTNESS`, `CACHE_DIR`, `CACHE_SIZE_MB`, `TIME_STYLE`/`DATE_STYLE`/`DAY_STYLE` (size, color on dark and on light backgrounds), `TEXT_CONTRAST`, `OUTLINE_WIDTH`, `BOX_ALPHA`, `SCALE_MODE`, `MAX_CROP`, `MIN_COVERAGE`, `BLUR_RADIUS`, `BLUR_BRIGHTNESS`, `OVERLAY_MARGIN`, `OVERLAY_LINE_GAP`, `WIDTH`/`HEIGHT`. When installed, re-run `pipx install --force .` after changing them.
 
 ### Image scaling
 
