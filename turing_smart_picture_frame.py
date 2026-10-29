@@ -3,6 +3,12 @@
 # Based on turing-smart-screen-python library
 #
 # Changelog:
+# 1.0.9 - Overlay text contrast: --text-contrast {auto+outline, auto, outline, box, off}
+#         (default auto+outline). auto picks, per background, the color with the best WCAG contrast
+#         between the dark-bg and light-bg colors of TIME_STYLE/DATE_STYLE/DAY_STYLE; outline adds a
+#         2 px outline (OUTLINE_WIDTH) in the opposite color; box draws a translucent box (BOX_ALPHA)
+# 1.0.8 - --font accepts a bundled font name (folder in res/fonts, case-insensitive, e.g. pacifico)
+#         or a path to a custom .ttf/.otf; --font-list prints the bundled fonts and exits
 # 1.0.7 - Processed images moved from ./.images to a persistent cache in $XDG_CACHE_HOME/tspf
 #         (default ~/.cache/tspf): files named by SHA-256 of the source image content + processing
 #         parameters, so they are reused across runs and for identical images in different directories;
@@ -50,8 +56,9 @@ Configuration:
    --debug       : Enable debug output (more verbose logging)
    --images PATH : Specify directory containing images (default: './images')
    --recursive   : Search for images recursively in subdirectories
-   --font PATH   : TrueType/OpenType font for the time/date overlay
-                   (default: bundled res/fonts/dejavu/DejaVuSans-Bold.ttf)
+   --font NAME|PATH: Font for the time/date overlay: bundled font name (folder name in
+                   res/fonts, e.g. pacifico) or path to a custom .ttf/.otf (default: dejavu)
+   --font-list   : List the bundled fonts usable as --font NAME and exit
    --interval SEC: Seconds between image changes (default: 30)
    --preload-images N: Use only N random images of the discovered ones, re-sampled after
                    all of them have been shown (default: 0 = no limit)
@@ -60,11 +67,13 @@ Configuration:
    --brightness N: Display brightness 0-100 (default: 50)
    --time-size N, --date-size N, --day-size N : Overlay font sizes (default: 34, 22, 24)
    --cache-size MB: Max size of the processed images cache (default: 100)
+   --text-contrast MODE: auto+outline, auto, outline, box or off (default: auto+outline)
 
 2. Hardcoded Configuration (modify in code; defaults of the options above):
    - COM_PORT, REVISION, IMAGE_ROTATION_INTERVAL, PRELOAD_IMAGES, BRIGHTNESS, CACHE_SIZE_MB
    - CACHE_DIR: processed images cache ($XDG_CACHE_HOME/tspf, default ~/.cache/tspf)
-   - TIME_STYLE, DATE_STYLE, DAY_STYLE: overlay (font size, color)
+   - TIME_STYLE, DATE_STYLE, DAY_STYLE: overlay (font size, color on dark bg, color on light bg)
+   - TEXT_CONTRAST, OUTLINE_WIDTH, BOX_ALPHA: overlay contrast mode, outline px, box opacity
    - OVERLAY_MARGIN, OVERLAY_LINE_GAP: overlay spacing in pixels
    - WIDTH, HEIGHT: Display dimensions in portrait mode (default: 320x480)
 
@@ -83,7 +92,7 @@ Notes:
 - To run from any folder, install the project with 'pip install --user .' instead of copying
   library/ into site-packages; the 'turing-smart-picture-frame' command is installed into ~/.local/bin
 - Text overlay uses the bundled font res/fonts/dejavu/DejaVuSans-Bold.ttf (see LICENSE.txt there)
-  unless --font is given
+  unless --font is given (bundled name, see --font-list, or path to a custom font)
 - Processed images are cached in $XDG_CACHE_HOME/tspf (default ~/.cache/tspf), named by the hash of
   the source image content; they survive restarts and are shared by identical images in different
   directories. The least recently used files are deleted when the cache exceeds --cache-size MB.
@@ -101,7 +110,7 @@ import hashlib
 import logging
 from datetime import datetime
 from importlib.resources import files
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 from threading import Thread, Event
 
 # Import LCD communication modules
@@ -112,7 +121,7 @@ from library.lcd.lcd_comm_rev_d import LcdCommRevD
 from library.lcd.lcd_simulated import LcdSimulated
 from library.log import logger
 
-__version__ = "1.0.7"
+__version__ = "1.0.9"
 
 # Configuration (defaults of the command line options)
 COM_PORT = "AUTO"  # Set your COM port or "AUTO" for auto-discovery
@@ -132,13 +141,23 @@ VERBOSE_LEVEL = "INFO"  # Default to INFO level
 
 # Set your font file style to use
 FONT_PATH = str(files("res").joinpath("fonts", "dejavu", "DejaVuSans-Bold.ttf"))
+DEFAULT_FONT = "dejavu"  # Bundled font name (res/fonts/<name>/) used when --font is not given
+FONT_EXTENSIONS = (".ttf", ".otf")
 
-# Time/date overlay, stacked from the bottom-right corner (font size, color)
-TIME_STYLE = (34, (255, 255, 255))
-DATE_STYLE = (22, (0, 255, 255))
-DAY_STYLE = (24, (0, 255, 255))
+# Time/date overlay, stacked from the bottom-right corner (font size, color on dark bg, color on light bg)
+TIME_STYLE = (34, (255, 255, 255), (0, 0, 0))
+DATE_STYLE = (22, (0, 255, 255), (0, 70, 90))
+DAY_STYLE = (24, (0, 255, 255), (0, 70, 90))
 OVERLAY_MARGIN = 6    # Pixels between overlay text and the right/bottom screen edges
 OVERLAY_LINE_GAP = 2  # Pixels between overlay lines
+
+# Text contrast against the background:
+#   auto+outline: auto color + outline   auto: pick the color with the best WCAG contrast
+#   outline: dark-bg color + outline     box: translucent dark box behind the text   off: dark-bg color only
+TEXT_CONTRAST = "auto+outline"
+TEXT_CONTRAST_MODES = ("auto+outline", "auto", "outline", "box", "off")
+OUTLINE_WIDTH = 2   # Outline thickness in pixels (outline modes)
+BOX_ALPHA = 120     # Opacity 0-255 of the box behind the text (box mode)
 
 def configure_logging(verbose_level):
     """Configure both custom and library logging levels"""
@@ -622,20 +641,51 @@ def initialize_display():
     lcd_comm.SetBackplateLedColor(led_color=(255, 255, 255))
     lcd_comm.SetOrientation(orientation=Orientation.LANDSCAPE)
 
-class OverlayLine:
-    """Right-aligned overlay text line drawn inside a fixed screen region over the background"""
+def relative_luminance(color):
+    """WCAG 2.x relative luminance of an sRGB color (0-255 channels)"""
+    channels = [value / 255 for value in color[:3]]
+    linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
 
-    def __init__(self, font, color, region, baseline):
+def contrast_ratio(luminance1, luminance2):
+    """WCAG 2.x contrast ratio between two relative luminances (1-21)"""
+    lighter, darker = max(luminance1, luminance2), min(luminance1, luminance2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+class OverlayLine:
+    """Right-aligned overlay text line drawn inside a fixed screen region over the background.
+
+    Depending on TEXT_CONTRAST the text color is chosen per background (best WCAG contrast between
+    the dark-bg and light-bg colors against the region's mean color), outlined with the opposite
+    color, or drawn over a translucent box."""
+
+    def __init__(self, font, light_color, dark_color, region, baseline, stroke_width):
         self.font = font
-        self.color = color
+        self.light_color = light_color
+        self.dark_color = dark_color
         self.region = region
         self.baseline = baseline
+        self.stroke_width = stroke_width
+
+    def text_color(self, image):
+        if TEXT_CONTRAST not in ("auto", "auto+outline"):
+            return self.light_color
+        background = relative_luminance(ImageStat.Stat(image).mean)
+        light = contrast_ratio(relative_luminance(self.light_color), background)
+        dark = contrast_ratio(relative_luminance(self.dark_color), background)
+        return self.light_color if light >= dark else self.dark_color
 
     def draw(self, text, background):
         left, top, right, bottom = self.region
         image = background.crop(self.region)
+        color = self.text_color(image)
+        if TEXT_CONTRAST == "box":
+            shade = Image.new("RGB", image.size, (0, 0, 0))
+            image = Image.blend(image, shade, BOX_ALPHA / 255)
+        outline = (0, 0, 0) if relative_luminance(color) > 0.4 else (255, 255, 255)
         ImageDraw.Draw(image).text((lcd_comm.get_width() - OVERLAY_MARGIN - left, self.baseline - top),
-                                   text, font=self.font, fill=self.color, anchor="rs")
+                                   text, font=self.font, fill=color, anchor="rs",
+                                   stroke_width=self.stroke_width, stroke_fill=outline)
         lcd_comm.DisplayPILImage(image, left, top)
 
 def build_overlay():
@@ -651,11 +701,13 @@ def build_overlay():
     ]
     width, height = lcd_comm.get_width(), lcd_comm.get_height()
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    stroke_width = OUTLINE_WIDTH if TEXT_CONTRAST in ("auto+outline", "outline") else 0
     result = []
     next_bottom = height - OVERLAY_MARGIN
-    for (font_size, color), samples in lines:
+    for (font_size, light_color, dark_color), samples in lines:
         font = lcd_comm.open_font(FONT_PATH, font_size)
-        boxes = [measure.textbbox((0, 0), sample, font=font, anchor="rs") for sample in samples]
+        boxes = [measure.textbbox((0, 0), sample, font=font, anchor="rs", stroke_width=stroke_width)
+                 for sample in samples]
         ink_left = min(box[0] for box in boxes)
         ink_top = min(box[1] for box in boxes)
         ink_bottom = max(box[3] for box in boxes)
@@ -664,7 +716,7 @@ def build_overlay():
                   max(0, baseline + ink_top),
                   width,
                   min(height, baseline + ink_bottom + 1))
-        result.append(OverlayLine(font, color, region, baseline))
+        result.append(OverlayLine(font, light_color, dark_color, region, baseline, stroke_width))
         next_bottom = region[1] - OVERLAY_LINE_GAP
     log_debug(f"Overlay regions (time, date, day): {[line.region for line in result]}")
     return result
@@ -753,9 +805,43 @@ def sighandler(signum, frame):
     log_info("Received shutdown signal")
     stop_event.set()
 
-def font_file(path):
-    """argparse type: expand and validate a TrueType/OpenType font path"""
-    path = os.path.expanduser(path)
+def bundled_fonts():
+    """Bundled fonts in res/fonts: {name (folder name, lowercase): (font file path, license file name)}"""
+    fonts = {}
+    for folder in sorted(files("res").joinpath("fonts").iterdir(), key=lambda entry: entry.name.lower()):
+        if not folder.is_dir():
+            continue
+        entries = sorted(folder.iterdir(), key=lambda entry: entry.name)
+        font_files = [entry for entry in entries if entry.name.lower().endswith(FONT_EXTENSIONS)]
+        licenses = [entry.name for entry in entries if entry.name.lower().endswith(".txt")]
+        if font_files:
+            fonts[folder.name.lower()] = (str(font_files[0]), licenses[0] if licenses else "")
+    return fonts
+
+def print_font_list():
+    """Print the bundled fonts usable as --font NAME"""
+    fonts = bundled_fonts()
+    name_width = max(len("NAME"), *(len(name) for name in fonts))
+    file_width = max(len("FILE"), *(len(os.path.basename(path)) for path, _ in fonts.values()))
+    print(f"{'NAME':<{name_width}}  {'FILE':<{file_width}}  LICENSE")
+    for name, (path, license_file) in fonts.items():
+        default = "  (default)" if name == DEFAULT_FONT else ""
+        print(f"{name:<{name_width}}  {os.path.basename(path):<{file_width}}  {license_file}{default}")
+    print("\nUsage: --font NAME (bundled) or --font /path/to/font.ttf (custom)")
+
+def font_file(value):
+    """argparse type: bundled font name (see --font-list) or path to a TrueType/OpenType font file.
+
+    Values containing a path separator, starting with '~' or ending in .ttf/.otf are paths."""
+    if "/" in value or os.sep in value or value.startswith("~") or value.lower().endswith(FONT_EXTENSIONS):
+        path = os.path.expanduser(value)
+    else:
+        fonts = bundled_fonts()
+        if value.lower() not in fonts:
+            raise argparse.ArgumentTypeError(
+                f"unknown bundled font '{value}' (available: {', '.join(fonts)}); "
+                "use a path for a custom font, e.g. ~/fonts/MyFont.ttf")
+        path = fonts[value.lower()][0]
     try:
         ImageFont.truetype(path, 10)
     except OSError as e:
@@ -784,8 +870,11 @@ def parse_arguments():
                        help="Path to images directory (default: 'images' in current location)")
     parser.add_argument("--recursive", action="store_true",
                        help="Search for images recursively in subdirectories")
-    parser.add_argument("--font", type=font_file, default=FONT_PATH,
-                       help="Font file for the time/date overlay (default: bundled DejaVuSans-Bold.ttf)")
+    parser.add_argument("--font", type=font_file, default=DEFAULT_FONT, metavar="NAME|PATH",
+                       help="Font for the time/date overlay: bundled font name (see --font-list) or path "
+                            f"to a custom .ttf/.otf file (default: {DEFAULT_FONT})")
+    parser.add_argument("--font-list", action="store_true",
+                       help="List the bundled fonts usable as --font NAME and exit")
     parser.add_argument("--interval", type=int_range(1), default=IMAGE_ROTATION_INTERVAL, metavar="SEC",
                        help=f"Seconds between image changes (default: {IMAGE_ROTATION_INTERVAL})")
     parser.add_argument("--preload-images", type=int_range(0), default=PRELOAD_IMAGES, metavar="N",
@@ -803,6 +892,10 @@ def parse_arguments():
                        help=f"Date font size (default: {DATE_STYLE[0]})")
     parser.add_argument("--day-size", type=int_range(1), default=DAY_STYLE[0], metavar="N",
                        help=f"Day of week font size (default: {DAY_STYLE[0]})")
+    parser.add_argument("--text-contrast", choices=TEXT_CONTRAST_MODES, default=TEXT_CONTRAST,
+                       help="Keep the overlay readable on any background: auto+outline = color chosen per "
+                            "background + outline, auto = color only, outline = outline only, box = translucent "
+                            f"box behind the text, off = fixed colors (default: {TEXT_CONTRAST})")
     parser.add_argument("--cache-size", type=int_range(1), default=CACHE_SIZE_MB, metavar="MB",
                        help=f"Max size of the processed images cache in {CACHE_DIR}; least recently used "
                             f"images are deleted first (default: {CACHE_SIZE_MB})")
@@ -812,17 +905,22 @@ def main():
     """Main slideshow function"""
     global current_background, VERBOSE_LEVEL, FONT_PATH, overlay
     global IMAGE_ROTATION_INTERVAL, REVISION, COM_PORT, BRIGHTNESS, TIME_STYLE, DATE_STYLE, DAY_STYLE
+    global TEXT_CONTRAST
 
     # Parse command line arguments
     args = parse_arguments()
+    if args.font_list:
+        print_font_list()
+        return
     FONT_PATH = args.font
     IMAGE_ROTATION_INTERVAL = args.interval
     REVISION = args.revision
     COM_PORT = args.port
     BRIGHTNESS = args.brightness
-    TIME_STYLE = (args.time_size, TIME_STYLE[1])
-    DATE_STYLE = (args.date_size, DATE_STYLE[1])
-    DAY_STYLE = (args.day_size, DAY_STYLE[1])
+    TIME_STYLE = (args.time_size,) + TIME_STYLE[1:]
+    DATE_STYLE = (args.date_size,) + DATE_STYLE[1:]
+    DAY_STYLE = (args.day_size,) + DAY_STYLE[1:]
+    TEXT_CONTRAST = args.text_contrast
 
     # Set verbosity level based on arguments
     if args.debug:
