@@ -3,6 +3,11 @@
 # Based on turing-smart-screen-python library
 #
 # Changelog:
+# 1.0.10 - Image scaling modes: --scale-mode {auto, fill, fit, blur} (default auto). auto crops at most
+#          --max-crop percent per side (default 15) and shows the rest whole over a blurred, darkened copy
+#          of the image; fill keeps the previous crop-to-fill. Portrait pairs and lone portraits use the
+#          same mode. --min-coverage PCT (default 40) skips images that would cover less than PCT of
+#          the screen (very wide panoramas). Scale settings are part of the cache key
 # 1.0.9 - Overlay text contrast: --text-contrast {auto+outline, auto, outline, box, off}
 #         (default auto+outline). auto picks, per background, the color with the best WCAG contrast
 #         between the dark-bg and light-bg colors of TIME_STYLE/DATE_STYLE/DAY_STYLE; outline adds a
@@ -68,12 +73,16 @@ Configuration:
    --time-size N, --date-size N, --day-size N : Overlay font sizes (default: 34, 22, 24)
    --cache-size MB: Max size of the processed images cache (default: 100)
    --text-contrast MODE: auto+outline, auto, outline, box or off (default: auto+outline)
+   --scale-mode MODE: auto, fill, fit or blur (default: auto)
+   --max-crop PCT: Percent of width/height auto may crop (default: 15)
+   --min-coverage PCT: Skip images covering less than PCT of the screen, 0 = never (default: 40)
 
 2. Hardcoded Configuration (modify in code; defaults of the options above):
    - COM_PORT, REVISION, IMAGE_ROTATION_INTERVAL, PRELOAD_IMAGES, BRIGHTNESS, CACHE_SIZE_MB
    - CACHE_DIR: processed images cache ($XDG_CACHE_HOME/tspf, default ~/.cache/tspf)
    - TIME_STYLE, DATE_STYLE, DAY_STYLE: overlay (font size, color on dark bg, color on light bg)
    - TEXT_CONTRAST, OUTLINE_WIDTH, BOX_ALPHA: overlay contrast mode, outline px, box opacity
+   - SCALE_MODE, MAX_CROP, MIN_COVERAGE, BLUR_RADIUS, BLUR_BRIGHTNESS: image scaling
    - OVERLAY_MARGIN, OVERLAY_LINE_GAP: overlay spacing in pixels
    - WIDTH, HEIGHT: Display dimensions in portrait mode (default: 320x480)
 
@@ -86,7 +95,7 @@ Usage:
 Image Requirements:
 - Supported formats: PNG, JPG/JPEG, BMP, GIF
 - Any orientation (portrait or landscape)
-- Will be automatically resized and formatted for display
+- Will be automatically resized and formatted for display (see --scale-mode)
 
 Notes:
 - To run from any folder, install the project with 'pip install --user .' instead of copying
@@ -110,7 +119,7 @@ import hashlib
 import logging
 from datetime import datetime
 from importlib.resources import files
-from PIL import Image, ImageDraw, ImageFont, ImageStat
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat
 from threading import Thread, Event
 
 # Import LCD communication modules
@@ -121,7 +130,7 @@ from library.lcd.lcd_comm_rev_d import LcdCommRevD
 from library.lcd.lcd_simulated import LcdSimulated
 from library.log import logger
 
-__version__ = "1.0.9"
+__version__ = "1.0.10"
 
 # Configuration (defaults of the command line options)
 COM_PORT = "AUTO"  # Set your COM port or "AUTO" for auto-discovery
@@ -158,6 +167,16 @@ TEXT_CONTRAST = "auto+outline"
 TEXT_CONTRAST_MODES = ("auto+outline", "auto", "outline", "box", "off")
 OUTLINE_WIDTH = 2   # Outline thickness in pixels (outline modes)
 BOX_ALPHA = 120     # Opacity 0-255 of the box behind the text (box mode)
+
+# Image scaling:
+#   auto: crop at most MAX_CROP % per side, show the rest whole over a blurred copy (= fill when that is enough)
+#   fill: crop to fill the screen   fit: whole image over black   blur: whole image over a blurred copy
+SCALE_MODE = "auto"
+SCALE_MODES = ("auto", "fill", "fit", "blur")
+MAX_CROP = 15         # Percent of width/height auto may crop
+MIN_COVERAGE = 40     # Skip images covering less than this percent of their area (not in fill), 0 = never
+BLUR_RADIUS = 18      # Gaussian blur radius of the background (blur/auto)
+BLUR_BRIGHTNESS = 0.55  # Brightness factor of the blurred background (blur/auto)
 
 def configure_logging(verbose_level):
     """Configure both custom and library logging levels"""
@@ -346,7 +365,7 @@ class ImageManager:
 
         # Categorize images by orientation
         self.categorize_images_by_orientation()
-        # A lone portrait can never form a pair: show it as landscape (crop-to-fill) like get_next_image does
+        # A lone portrait can never form a pair: show it full screen like get_next_image does
         if len(self.portrait_images) == 1 and self.landscape_images:
             self.landscape_images.append(self.portrait_images.pop())
         # Shuffle both lists for random order
@@ -364,11 +383,20 @@ class ImageManager:
         self.portrait_images = []
         self.landscape_images = []
 
+        skipped = 0
         for image_path in self.image_list:
             try:
                 with Image.open(image_path) as img:
                     width, height = img.size
-                    if height > width:
+                    portrait = height > width
+                    # Portraits are shown in pairs, each one in half of the screen
+                    target_width = self.display_width // 2 if portrait else self.display_width
+                    coverage = self.coverage(width, height, target_width, self.display_height)
+                    if coverage < MIN_COVERAGE / 100:
+                        skipped += 1
+                        log_debug(f"Skipped: {os.path.basename(image_path)} ({width}x{height}) would cover "
+                                  f"{coverage:.0%} of its area, below --min-coverage {MIN_COVERAGE}%")
+                    elif portrait:
                         self.portrait_images.append(image_path)
                         log_debug(f"Portrait: {os.path.basename(image_path)} ({width}x{height})")
                     else:
@@ -378,7 +406,8 @@ class ImageManager:
                 log_error(f"Error reading image {image_path}: {e}")
                 continue
 
-        log_info(f"Categorized images: {len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape")
+        log_info(f"Categorized images: {len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape"
+                 + (f", {skipped} skipped (below --min-coverage {MIN_COVERAGE}%)" if skipped else ""))
 
     def create_default_image(self):
         """Create a default gradient background if no images are found"""
@@ -422,6 +451,7 @@ class ImageManager:
         """Resize two portrait images to fit side by side on screen"""
         try:
             processed_path = self.cache.path_for("pair", self.display_width, self.display_height,
+                                                 SCALE_MODE, MAX_CROP, BLUR_RADIUS, BLUR_BRIGHTNESS,
                                                  self.cache.content_hash(image_path1),
                                                  self.cache.content_hash(image_path2))
             if self.cache.get(processed_path):
@@ -438,25 +468,12 @@ class ImageManager:
                 if img2.mode != 'RGB':
                     img2 = img2.convert('RGB')
 
-                # Each image gets half the screen width
-                target_width = self.display_width // 2
-                target_height = self.display_height
-
-                # Resize both images to fit in their half-screen space
-                resized_img1 = self.resize_to_fit(img1, target_width, target_height)
-                resized_img2 = self.resize_to_fit(img2, target_width, target_height)
-
-                # Create final combined image
+                # Each image gets half the screen width, scaled according to SCALE_MODE
+                half_width = self.display_width // 2
                 final_img = Image.new('RGB', (self.display_width, self.display_height), (0, 0, 0))
-
-                # Center each image in its half
-                x1 = (target_width - resized_img1.width) // 2
-                y1 = (target_height - resized_img1.height) // 2
-                final_img.paste(resized_img1, (x1, y1))
-
-                x2 = target_width + (target_width - resized_img2.width) // 2
-                y2 = (target_height - resized_img2.height) // 2
-                final_img.paste(resized_img2, (x2, y2))
+                final_img.paste(self.compose(img1, half_width, self.display_height), (0, 0))
+                final_img.paste(self.compose(img2, self.display_width - half_width, self.display_height),
+                                (half_width, 0))
 
                 self.cache.put(processed_path, final_img)
 
@@ -470,12 +487,13 @@ class ImageManager:
             return None
 
     def resize_landscape_single(self, image_path):
-        """Resize single landscape image to fill full screen (crop to fill, no black bars)"""
+        """Scale a single image to the full screen according to SCALE_MODE"""
         try:
             processed_path = self.cache.path_for("landscape", self.display_width, self.display_height,
+                                                 SCALE_MODE, MAX_CROP, BLUR_RADIUS, BLUR_BRIGHTNESS,
                                                  self.cache.content_hash(image_path))
             if self.cache.get(processed_path):
-                log_info(f"Cached landscape (crop-to-fill): {os.path.basename(image_path)}")
+                log_info(f"Cached landscape ({SCALE_MODE}): {os.path.basename(image_path)}")
                 return processed_path
 
             log_debug(f"Processing landscape image: {os.path.basename(image_path)}")
@@ -484,12 +502,11 @@ class ImageManager:
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
 
-                # Use crop-to-fill approach to eliminate black bars
-                final_img = self.resize_to_fill(img, self.display_width, self.display_height)
+                final_img = self.compose(img, self.display_width, self.display_height)
 
                 self.cache.put(processed_path, final_img)
 
-                log_info(f"Processed landscape (crop-to-fill): {os.path.basename(image_path)}")
+                log_info(f"Processed landscape ({SCALE_MODE}): {os.path.basename(image_path)}")
                 log_debug(f"Saved to: {processed_path}")
 
                 return processed_path
@@ -498,50 +515,55 @@ class ImageManager:
             log_error(f"Error processing landscape image {image_path}: {e}")
             return None
 
-    def resize_to_fit(self, img, target_width, target_height):
-        """Helper method to resize image to fit within target dimensions while maintaining aspect ratio"""
-        orig_width, orig_height = img.size
+    @staticmethod
+    def crop_box(width, height, aspect, max_crop):
+        """Centered crop box moving width x height toward aspect, removing at most max_crop (0-1) of a side"""
+        if width / height > aspect:
+            new_width = max(height * aspect, width * (1 - max_crop))
+            left = (width - new_width) / 2
+            return left, 0, left + new_width, height
+        new_height = max(width / aspect, height * (1 - max_crop))
+        top = (height - new_height) / 2
+        return 0, top, width, top + new_height
 
-        # Calculate scaling factor to fit within bounds
-        scale_x = target_width / orig_width
-        scale_y = target_height / orig_height
-        scale = min(scale_x, scale_y)  # Use smaller scale to fit entirely
+    @staticmethod
+    def fitted_size(width, height, target_width, target_height):
+        """Largest size with the aspect ratio of width x height that fits in target_width x target_height"""
+        scale = min(target_width / width, target_height / height)
+        return max(1, round(width * scale)), max(1, round(height * scale))
 
-        # Calculate new dimensions
-        new_width = int(orig_width * scale)
-        new_height = int(orig_height * scale)
+    @staticmethod
+    def mode_max_crop():
+        """Fraction of a side SCALE_MODE may crop: fill = all needed, auto = MAX_CROP, fit/blur = none"""
+        return {"fill": 1.0, "auto": MAX_CROP / 100}.get(SCALE_MODE, 0.0)
 
-        # Resize image
-        return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    def coverage(self, width, height, target_width, target_height):
+        """Fraction of the target area the image covers in the current SCALE_MODE (1.0 for fill)"""
+        left, top, right, bottom = self.crop_box(width, height, target_width / target_height, self.mode_max_crop())
+        fitted_width, fitted_height = self.fitted_size(right - left, bottom - top, target_width, target_height)
+        return fitted_width * fitted_height / (target_width * target_height)
 
-    def resize_to_fill(self, img, target_width, target_height):
-        """Helper method to resize and crop image to fill target dimensions completely (no black bars)"""
-        orig_width, orig_height = img.size
+    def compose(self, img, target_width, target_height):
+        """Scale img to target_width x target_height according to SCALE_MODE.
 
-        # Calculate scaling factor to fill the entire target area
-        scale_x = target_width / orig_width
-        scale_y = target_height / orig_height
-        scale = max(scale_x, scale_y)  # Use larger scale to fill entirely
-
-        # Calculate new dimensions (will be larger than target)
-        new_width = int(orig_width * scale)
-        new_height = int(orig_height * scale)
-
-        log_debug(f"Fill scaling: {orig_width}x{orig_height} -> {new_width}x{new_height} (scale: {scale:.3f})")
-
-        # Resize image
-        resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-        # Calculate crop coordinates to center the image
-        crop_x = (new_width - target_width) // 2
-        crop_y = (new_height - target_height) // 2
-
-        log_debug(f"Cropping from ({crop_x}, {crop_y}) to get {target_width}x{target_height}")
-
-        # Crop to exact target dimensions
-        cropped_img = resized_img.crop((crop_x, crop_y, crop_x + target_width, crop_y + target_height))
-
-        return cropped_img
+        fill: crop to fill the target; fit: whole image over black; blur: whole image over a blurred,
+        darkened copy of itself; auto: crop at most MAX_CROP percent per side, rest as in blur
+        (identical to fill when that crop is enough)."""
+        aspect = target_width / target_height
+        if SCALE_MODE == "fit":
+            canvas = Image.new("RGB", (target_width, target_height))
+        else:
+            canvas = img.crop(self.crop_box(img.width, img.height, aspect, 1.0))
+            canvas = canvas.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            if SCALE_MODE == "fill":
+                return canvas
+            canvas = canvas.filter(ImageFilter.GaussianBlur(BLUR_RADIUS))
+            canvas = ImageEnhance.Brightness(canvas).enhance(BLUR_BRIGHTNESS)
+        source = img.crop(self.crop_box(img.width, img.height, aspect, self.mode_max_crop()))
+        fitted = source.resize(self.fitted_size(source.width, source.height, target_width, target_height),
+                               Image.Resampling.LANCZOS)
+        canvas.paste(fitted, ((target_width - fitted.width) // 2, (target_height - fitted.height) // 2))
+        return canvas
 
     def get_next_image(self):
         """Get the next processed image for display with 50/50 probability between portrait pairs and landscape"""
@@ -896,6 +918,16 @@ def parse_arguments():
                        help="Keep the overlay readable on any background: auto+outline = color chosen per "
                             "background + outline, auto = color only, outline = outline only, box = translucent "
                             f"box behind the text, off = fixed colors (default: {TEXT_CONTRAST})")
+    parser.add_argument("--scale-mode", choices=SCALE_MODES, default=SCALE_MODE,
+                       help="How images are fitted to the screen: auto = crop at most --max-crop percent and "
+                            "show the rest whole over a blurred background, fill = crop to fill, fit = whole "
+                            f"image over black, blur = whole image over a blurred background (default: {SCALE_MODE})")
+    parser.add_argument("--max-crop", type=int_range(0, 100), default=MAX_CROP, metavar="PCT",
+                       help=f"Percent of the width or height auto may crop (default: {MAX_CROP})")
+    parser.add_argument("--min-coverage", type=int_range(0, 100), default=MIN_COVERAGE, metavar="PCT",
+                       help="Skip images that would cover less than PCT percent of the screen (of half the "
+                            f"screen for portrait pairs), e.g. very wide panoramas; 0 = never, not used by fill "
+                            f"(default: {MIN_COVERAGE})")
     parser.add_argument("--cache-size", type=int_range(1), default=CACHE_SIZE_MB, metavar="MB",
                        help=f"Max size of the processed images cache in {CACHE_DIR}; least recently used "
                             f"images are deleted first (default: {CACHE_SIZE_MB})")
@@ -905,7 +937,7 @@ def main():
     """Main slideshow function"""
     global current_background, VERBOSE_LEVEL, FONT_PATH, overlay
     global IMAGE_ROTATION_INTERVAL, REVISION, COM_PORT, BRIGHTNESS, TIME_STYLE, DATE_STYLE, DAY_STYLE
-    global TEXT_CONTRAST
+    global TEXT_CONTRAST, SCALE_MODE, MAX_CROP, MIN_COVERAGE
 
     # Parse command line arguments
     args = parse_arguments()
@@ -921,6 +953,9 @@ def main():
     DATE_STYLE = (args.date_size,) + DATE_STYLE[1:]
     DAY_STYLE = (args.day_size,) + DAY_STYLE[1:]
     TEXT_CONTRAST = args.text_contrast
+    SCALE_MODE = args.scale_mode
+    MAX_CROP = args.max_crop
+    MIN_COVERAGE = args.min_coverage
 
     # Set verbosity level based on arguments
     if args.debug:
