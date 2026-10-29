@@ -803,7 +803,7 @@ def background_rotation_thread(image_manager):
 
     log_debug("Background rotation thread started")
 
-    while not stop_event.is_set():
+    while not stop_event.wait(IMAGE_ROTATION_INTERVAL):
         try:
             log_debug("Getting next background image...")
             new_background = image_manager.get_next_image()
@@ -818,10 +818,6 @@ def background_rotation_thread(image_manager):
             log_debug(f"Exception details: {type(e).__name__}: {str(e)}")
             import traceback
             log_debug(f"Traceback: {traceback.format_exc()}")
-
-        # Wait for rotation interval or stop event
-        log_debug(f"Waiting {IMAGE_ROTATION_INTERVAL} seconds for next rotation...")
-        stop_event.wait(IMAGE_ROTATION_INTERVAL)
 
     log_debug("Background rotation thread stopped")
 
