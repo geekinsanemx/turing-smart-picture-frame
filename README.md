@@ -122,7 +122,7 @@ Each image is resized/cropped for the screen the first time it is shown and stor
 
 When the cache exceeds `--cache-size` MB, the least recently used files are deleted. The cache can also be removed manually at any time.
 
-Files created in the current directory: `log.log`, and with `SIMU` also `screencap.png` and `tmp`.
+Nothing is written to the current directory or to the images directory. Other runtime files are also kept in `$XDG_CACHE_HOME/tspf/` (default `~/.cache/tspf/`): `log.log` (max 1 MB), and with `--revision SIMU` the `simu/` subdirectory (`screencap.png`, `tmp`). The cache size limit only counts processed images, so these files are never deleted by it.
 
 ## Fonts
 
