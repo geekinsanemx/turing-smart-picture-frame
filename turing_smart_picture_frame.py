@@ -3,6 +3,10 @@
 # Based on turing-smart-screen-python library
 #
 # Changelog:
+# 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
+#          command line option with its value, including defaults, plus the cache directory and log file.
+#          The scattered startup lines for the cache, log file, rotation interval, source directory and
+#          recursive search were removed (now in that block)
 # 1.0.11 - log.log moved from the current working directory to $XDG_CACHE_HOME/tspf (default
 #          ~/.cache/tspf), SIMU screencap.png/tmp to its simu/ subdirectory: running from the images
 #          directory no longer writes files there. CACHE_DIR now comes from library.log.APP_DIR
@@ -114,6 +118,8 @@ Notes:
 - An image is processed the first time it is shown; later it is read from the cache.
 - The log is written to $XDG_CACHE_HOME/tspf/log.log (max 1 MB); with --revision SIMU the simulated
   screen is written to $XDG_CACHE_HOME/tspf/simu/screencap.png. Nothing is written to the current directory.
+- At startup the effective configuration is logged: every option with its value, defaults included,
+  plus the cache directory and log file.
 """
 
 import os
@@ -138,7 +144,7 @@ from library.lcd.lcd_comm_rev_d import LcdCommRevD
 from library.lcd.lcd_simulated import LcdSimulated
 from library.log import APP_DIR, LOG_FILE, logger
 
-__version__ = "1.0.11"
+__version__ = "1.0.12"
 
 # Configuration (defaults of the command line options)
 COM_PORT = "AUTO"  # Set your COM port or "AUTO" for auto-discovery
@@ -937,6 +943,17 @@ def parse_arguments():
                             f"images are deleted first (default: {CACHE_SIZE_MB})")
     return parser.parse_args()
 
+def log_configuration(args):
+    """Log every option with its effective value, defaults included"""
+    settings = {f"--{dest.replace('_', '-')}": value
+                for dest, value in vars(args).items() if dest != "font_list"}
+    settings["--images"] = os.path.abspath(args.images)
+    settings["cache dir"] = CACHE_DIR
+    settings["log file"] = LOG_FILE
+    width = max(len(name) for name in settings)
+    for name, value in settings.items():
+        log_info(f"{name:<{width}}  {value}")
+
 def main():
     """Main slideshow function"""
     global current_background, VERBOSE_LEVEL, FONT_PATH, overlay
@@ -970,6 +987,7 @@ def main():
         log_info("Info mode - showing info, warning, and error messages only")
 
     configure_logging(VERBOSE_LEVEL)
+    log_configuration(args)
 
     # Set up signal handlers
     signal.signal(signal.SIGINT, sighandler)
@@ -985,8 +1003,6 @@ def main():
 
         # Create image manager with command line arguments
         cache = ImageCache(CACHE_DIR, args.cache_size * 1024 * 1024)
-        log_info(f"Image cache: {CACHE_DIR} (max {args.cache_size} MB)")
-        log_info(f"Log file: {LOG_FILE}")
         image_manager = ImageManager(source_images_dir=args.images,
                                    cache=cache,
                                    recursive_search=args.recursive,
@@ -1007,9 +1023,6 @@ def main():
         frame_count = 0
         log_info("Starting image slideshow (Press Ctrl+C to exit)")
         log_info(f"Display dimensions: {lcd_comm.get_width()}x{lcd_comm.get_height()}")
-        log_info(f"Image rotation interval: {IMAGE_ROTATION_INTERVAL} seconds")
-        log_info(f"Source directory: {os.path.abspath(args.images)}")
-        log_info(f"Recursive search: {'enabled' if args.recursive else 'disabled'}")
         log_info(f"Total images: {len(image_manager.image_list)} in rotation, "
                  f"{len(image_manager.discovered_images)} discovered")
 
