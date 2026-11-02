@@ -83,7 +83,7 @@ turing-smart-picture-frame [--images PATH] [--recursive] [--preload-images N] [-
 | `--cache-size MB` | Max size of the processed images cache; least recently used images are deleted first (default: `100`) |
 | `--debug` | Debug logging |
 
-At startup the effective configuration is logged before anything else: every option above (except `--font-list`) with its value, defaults included, marked with `*` when it differs from the default, plus the cache directory and log file. A value passed on the command line that equals the default is not marked.
+At startup the effective configuration is logged before anything else: every option above (except `--font-list`) with its value, defaults included, plus the cache directory and log file.
 
 Image extensions are matched case-insensitively (`.jpg`, `.JPG`, `.Jpg`, ...). Hidden files and directories are skipped.
 

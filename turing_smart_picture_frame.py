@@ -4,9 +4,9 @@
 #
 # Changelog:
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
-#          command line option with its value, including defaults (* marks values that differ from the
-#          default), plus the cache directory and log file. The scattered startup lines for the cache, log
-#          file, rotation interval, source directory and recursive search were removed (now in that block)
+#          command line option with its value, including defaults, plus the cache directory and log file.
+#          The scattered startup lines for the cache, log file, rotation interval, source directory and
+#          recursive search were removed (now in that block)
 # 1.0.11 - log.log moved from the current working directory to $XDG_CACHE_HOME/tspf (default
 #          ~/.cache/tspf), SIMU screencap.png/tmp to its simu/ subdirectory: running from the images
 #          directory no longer writes files there. CACHE_DIR now comes from library.log.APP_DIR
@@ -118,8 +118,8 @@ Notes:
 - An image is processed the first time it is shown; later it is read from the cache.
 - The log is written to $XDG_CACHE_HOME/tspf/log.log (max 1 MB); with --revision SIMU the simulated
   screen is written to $XDG_CACHE_HOME/tspf/simu/screencap.png. Nothing is written to the current directory.
-- At startup the effective configuration is logged: every option with its value, defaults included
-  (* = differs from the default), plus the cache directory and log file.
+- At startup the effective configuration is logged: every option with its value, defaults included,
+  plus the cache directory and log file.
 """
 
 import os
@@ -893,8 +893,8 @@ def int_range(minimum, maximum=None):
         return number
     return parse
 
-def build_parser():
-    """Command line parser with every option and its default"""
+def parse_arguments():
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Turing Smart Screen Image Slideshow")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug output (default: INFO level only)")
@@ -941,20 +941,18 @@ def build_parser():
     parser.add_argument("--cache-size", type=int_range(1), default=CACHE_SIZE_MB, metavar="MB",
                        help=f"Max size of the processed images cache in {CACHE_DIR}; least recently used "
                             f"images are deleted first (default: {CACHE_SIZE_MB})")
-    return parser
+    return parser.parse_args()
 
-def log_configuration(parser, args):
-    """Log every option with its effective value, defaults included (* = differs from the default)"""
-    defaults = vars(parser.parse_args([]))
-    settings = {f"--{dest.replace('_', '-')}": (value, value != defaults[dest])
+def log_configuration(args):
+    """Log every option with its effective value, defaults included"""
+    settings = {f"--{dest.replace('_', '-')}": value
                 for dest, value in vars(args).items() if dest != "font_list"}
-    settings["--images"] = (os.path.abspath(args.images), settings["--images"][1])
-    settings["cache dir"] = (CACHE_DIR, False)
-    settings["log file"] = (LOG_FILE, False)
+    settings["--images"] = os.path.abspath(args.images)
+    settings["cache dir"] = CACHE_DIR
+    settings["log file"] = LOG_FILE
     width = max(len(name) for name in settings)
-    log_info("Configuration (* = differs from default):")
-    for name, (value, changed) in settings.items():
-        log_info(f"  {name:<{width}}  {value}{'  *' if changed else ''}")
+    for name, value in settings.items():
+        log_info(f"{name:<{width}}  {value}")
 
 def main():
     """Main slideshow function"""
@@ -963,8 +961,7 @@ def main():
     global TEXT_CONTRAST, SCALE_MODE, MAX_CROP, MIN_COVERAGE
 
     # Parse command line arguments
-    parser = build_parser()
-    args = parser.parse_args()
+    args = parse_arguments()
     if args.font_list:
         print_font_list()
         return
@@ -990,7 +987,7 @@ def main():
         log_info("Info mode - showing info, warning, and error messages only")
 
     configure_logging(VERBOSE_LEVEL)
-    log_configuration(parser, args)
+    log_configuration(args)
 
     # Set up signal handlers
     signal.signal(signal.SIGINT, sighandler)
