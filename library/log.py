@@ -19,7 +19,12 @@
 # Configure logging format
 import locale
 import logging
+import os
 from logging.handlers import RotatingFileHandler
+
+APP_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "tspf")
+LOG_FILE = os.path.join(APP_DIR, "log.log")
+os.makedirs(APP_DIR, exist_ok=True)
 
 # use current locale for date/time formatting in logs
 locale.setlocale(locale.LC_ALL, '')
@@ -27,7 +32,7 @@ locale.setlocale(locale.LC_ALL, '')
 logging.basicConfig(  # format='%(asctime)s [%(levelname)s] %(message)s in %(pathname)s:%(lineno)d',
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        RotatingFileHandler("log.log", maxBytes=1000000, backupCount=0),  # Log in textfile max 1MB
+        RotatingFileHandler(LOG_FILE, maxBytes=1000000, backupCount=0),  # Log in textfile max 1MB
         logging.StreamHandler()  # Log also in console
     ],
     datefmt='%x %X')

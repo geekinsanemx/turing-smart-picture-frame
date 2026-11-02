@@ -17,12 +17,17 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import mimetypes
+import os
 import shutil
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from library.lcd.lcd_comm import *
+from library.log import APP_DIR
 
-SCREENSHOT_FILE = "screencap.png"
+SIMU_DIR = os.path.join(APP_DIR, "simu")
+SCREENSHOT_NAME = "screencap.png"
+SCREENSHOT_FILE = os.path.join(SIMU_DIR, SCREENSHOT_NAME)
+TMP_FILE = os.path.join(SIMU_DIR, "tmp")
 WEBSERVER_PORT = 5678
 
 
@@ -36,16 +41,16 @@ class SimulatedLcdWebServer(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-type", "text/html")
             self.end_headers()
-            self.wfile.write(bytes("<img src=\"" + SCREENSHOT_FILE + "\" id=\"myImage\" />", "utf-8"))
+            self.wfile.write(bytes("<img src=\"" + SCREENSHOT_NAME + "\" id=\"myImage\" />", "utf-8"))
             self.wfile.write(bytes("<script>", "utf-8"))
             self.wfile.write(bytes("setInterval(function() {", "utf-8"))
             self.wfile.write(bytes("    var myImageElement = document.getElementById('myImage');", "utf-8"))
-            self.wfile.write(bytes("    myImageElement.src = '" + SCREENSHOT_FILE + "?rand=' + Math.random();", "utf-8"))
+            self.wfile.write(bytes("    myImageElement.src = '" + SCREENSHOT_NAME + "?rand=' + Math.random();", "utf-8"))
             self.wfile.write(bytes("}, 250);", "utf-8"))
             self.wfile.write(bytes("</script>", "utf-8"))
-        elif self.path.startswith("/" + SCREENSHOT_FILE):
+        elif self.path.startswith("/" + SCREENSHOT_NAME):
             imgfile = open(SCREENSHOT_FILE, 'rb').read()
-            mimetype = mimetypes.MimeTypes().guess_type(SCREENSHOT_FILE)[0]
+            mimetype = mimetypes.MimeTypes().guess_type(SCREENSHOT_NAME)[0]
             self.send_response(200)
             if mimetype is not None:
                 self.send_header('Content-type', mimetype)
@@ -59,8 +64,9 @@ class LcdSimulated(LcdComm):
                  update_queue: Optional[queue.Queue] = None):
         LcdComm.__init__(self, com_port, display_width, display_height, update_queue)
         self.screen_image = Image.new("RGB", (self.get_width(), self.get_height()), (255, 255, 255))
-        self.screen_image.save("tmp", "PNG")
-        shutil.copyfile("tmp", SCREENSHOT_FILE)
+        os.makedirs(SIMU_DIR, exist_ok=True)
+        self.screen_image.save(TMP_FILE, "PNG")
+        shutil.copyfile(TMP_FILE, SCREENSHOT_FILE)
         self.orientation = Orientation.PORTRAIT
 
         try:
@@ -107,8 +113,8 @@ class LcdSimulated(LcdComm):
         # Just draw the screen again with the new width/height based on orientation
         with self.update_queue_mutex:
             self.screen_image = Image.new("RGB", (self.get_width(), self.get_height()), (255, 255, 255))
-            self.screen_image.save("tmp", "PNG")
-            shutil.copyfile("tmp", SCREENSHOT_FILE)
+            self.screen_image.save(TMP_FILE, "PNG")
+            shutil.copyfile(TMP_FILE, SCREENSHOT_FILE)
 
     def DisplayPILImage(
             self,
@@ -136,5 +142,5 @@ class LcdSimulated(LcdComm):
 
         with self.update_queue_mutex:
             self.screen_image.paste(image, (x, y))
-            self.screen_image.save("tmp", "PNG")
-            shutil.copyfile("tmp", SCREENSHOT_FILE)
+            self.screen_image.save(TMP_FILE, "PNG")
+            shutil.copyfile(TMP_FILE, SCREENSHOT_FILE)

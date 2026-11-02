@@ -3,6 +3,9 @@
 # Based on turing-smart-screen-python library
 #
 # Changelog:
+# 1.0.11 - log.log moved from the current working directory to $XDG_CACHE_HOME/tspf (default
+#          ~/.cache/tspf), SIMU screencap.png/tmp to its simu/ subdirectory: running from the images
+#          directory no longer writes files there. CACHE_DIR now comes from library.log.APP_DIR
 # 1.0.10 - Image scaling modes: --scale-mode {auto, fill, fit, blur} (default auto). auto crops at most
 #          --max-crop percent per side (default 15) and shows the rest whole over a blurred, darkened copy
 #          of the image; fill keeps the previous crop-to-fill. Portrait pairs and lone portraits use the
@@ -109,6 +112,8 @@ Notes:
   the source image content; they survive restarts and are shared by identical images in different
   directories. The least recently used files are deleted when the cache exceeds --cache-size MB.
 - An image is processed the first time it is shown; later it is read from the cache.
+- The log is written to $XDG_CACHE_HOME/tspf/log.log (max 1 MB); with --revision SIMU the simulated
+  screen is written to $XDG_CACHE_HOME/tspf/simu/screencap.png. Nothing is written to the current directory.
 """
 
 import os
@@ -131,9 +136,9 @@ from library.lcd.lcd_comm_rev_b import LcdCommRevB
 from library.lcd.lcd_comm_rev_c import LcdCommRevC
 from library.lcd.lcd_comm_rev_d import LcdCommRevD
 from library.lcd.lcd_simulated import LcdSimulated
-from library.log import logger
+from library.log import APP_DIR, LOG_FILE, logger
 
-__version__ = "1.0.10"
+__version__ = "1.0.11"
 
 # Configuration (defaults of the command line options)
 COM_PORT = "AUTO"  # Set your COM port or "AUTO" for auto-discovery
@@ -144,7 +149,7 @@ IMAGE_ROTATION_INTERVAL = 30  # Seconds between background changes
 PRELOAD_IMAGES = 0  # Random sample size of discovered images, 0 = no limit
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif"}
 BRIGHTNESS = 50    # Display brightness 0-100
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "tspf")
+CACHE_DIR = APP_DIR
 CACHE_SIZE_MB = 100  # Max size of CACHE_DIR, least recently used images are deleted first
 CACHE_FORMAT = 1     # Part of every cache key: bump when image processing changes to invalidate old files
 
@@ -981,6 +986,7 @@ def main():
         # Create image manager with command line arguments
         cache = ImageCache(CACHE_DIR, args.cache_size * 1024 * 1024)
         log_info(f"Image cache: {CACHE_DIR} (max {args.cache_size} MB)")
+        log_info(f"Log file: {LOG_FILE}")
         image_manager = ImageManager(source_images_dir=args.images,
                                    cache=cache,
                                    recursive_search=args.recursive,
