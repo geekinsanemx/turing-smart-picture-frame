@@ -5,13 +5,15 @@
 # Changelog:
 # 1.0.13 - Image changes aligned to the clock: the first image is shown at startup, every following change
 #          happens at a multiple of --interval seconds counted from local midnight (interval 30 -> :00 and
-#          :30, 3600 -> X:00:00), realigned at 00:00:00 every day. The next image is prepared before its
+#          :30, 3600 -> X:00:00), realigned at 00:00:00 every day; multiples follow the local wall clock
+#          across daylight saving changes. The next image is prepared before its
 #          change time, and the main loop draws on whole seconds, so the change starts on time.
 #          --auto-refresh [SEC] (default 3600 when given without a value) rescans the source directory in
 #          its own thread: new images join the end of the rotation queue, deleted ones leave it, without
 #          interrupting the clock or the rotation. Orientation of each image is remembered per
 #          (path, mtime, size), so a rescan only opens new or modified files; an image whose orientation
-#          changes at the same path moves to the other queue. A rescan where any directory cannot be
+#          changes at the same path moves to the other queue, and portraits pair again as soon as two
+#          are available. A rescan where any directory cannot be
 #          read is discarded and the current images are kept
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
 #          command line option with its value, including defaults, plus the cache directory and log file.
@@ -137,6 +139,7 @@ Notes:
   plus the cache directory and log file.
 - The first image is shown at startup; the next ones change at the next multiple of --interval seconds
   from local midnight. An interval that does not divide 24 h is realigned at 00:00:00 every day.
+  Multiples follow the local wall clock, also across daylight saving changes.
 - --auto-refresh adds new images to the end of the rotation queue and removes deleted ones; with
   --preload-images new images enter the next random sample. If the images directory or any scanned
   subdirectory cannot be read during a rescan, the current images are kept.
@@ -152,7 +155,7 @@ import argparse
 import calendar
 import hashlib
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from importlib.resources import files
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat
 from threading import Thread, Event, Lock
@@ -456,9 +459,12 @@ class ImageManager:
         return list(discovered)
 
     def balance_portraits(self, portraits):
-        """A lone portrait can never form a pair: show it full screen, and pair it again once a partner exists"""
+        """A lone portrait can never form a pair: show it full screen, and pair it again once a partner exists.
+
+        Portraits kept in the landscape queue (lone, or landscape images replaced by portraits at the same
+        path) move to the portrait queue whenever together with it they can form a pair."""
         lone = [image_path for image_path in self.landscape_images if image_path in portraits]
-        if lone and self.portrait_images:
+        if lone and len(lone) + len(self.portrait_images) >= 2:
             self.landscape_images = [image_path for image_path in self.landscape_images if image_path not in portraits]
             self.portrait_images.extend(lone)
         if len(self.portrait_images) == 1 and self.landscape_images:
@@ -937,17 +943,51 @@ def display_slideshow_content(background_image, force_background_refresh=False):
         import traceback
         logger.debug(f"Traceback: {traceback.format_exc()}")
 
-def next_transition(timestamp):
-    """First instant after timestamp at a multiple of IMAGE_ROTATION_INTERVAL seconds from local midnight.
+def utc_offset(timestamp):
+    """Local UTC offset in seconds at timestamp"""
+    return time.localtime(timestamp).tm_gmtoff
 
-    Intervals up to one day are capped at the next midnight, so every day starts aligned at 00:00:00."""
-    midnight = datetime.fromtimestamp(timestamp).replace(hour=0, minute=0, second=0, microsecond=0)
-    start = midnight.timestamp()
-    steps = math.floor((timestamp - start) / IMAGE_ROTATION_INTERVAL) + 1
-    due = start + steps * IMAGE_ROTATION_INTERVAL
+def seconds_to_multiple(wall, inclusive):
+    """Seconds from the local wall-clock time wall (naive datetime) to the next multiple of
+    IMAGE_ROTATION_INTERVAL seconds counted from its midnight; inclusive also accepts wall itself.
+
+    Intervals up to one day are capped at the next midnight."""
+    elapsed = (wall - wall.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds()
+    if inclusive:
+        steps = math.ceil(elapsed / IMAGE_ROTATION_INTERVAL)
+    else:
+        steps = math.floor(elapsed / IMAGE_ROTATION_INTERVAL) + 1
+    target = steps * IMAGE_ROTATION_INTERVAL
     if IMAGE_ROTATION_INTERVAL <= SECONDS_PER_DAY:
-        due = min(due, (midnight + timedelta(days=1)).timestamp())
-    return due
+        target = min(target, SECONDS_PER_DAY)
+    return target - elapsed
+
+def offset_change(start, end):
+    """First whole second after start, up to end, where the local UTC offset changes (DST), or None"""
+    low, high = math.ceil(start), math.ceil(end)
+    offset = utc_offset(low)
+    if utc_offset(high) == offset:
+        return None
+    while high - low > 1:
+        middle = (low + high) // 2
+        if utc_offset(middle) == offset:
+            low = middle
+        else:
+            high = middle
+    return high
+
+def next_transition(timestamp):
+    """First instant after timestamp whose local wall-clock time is a multiple of IMAGE_ROTATION_INTERVAL
+    seconds from midnight.
+
+    Intervals up to one day are capped at the next midnight, so every day starts aligned at 00:00:00.
+    When a daylight saving change comes first, the multiple is taken from the wall clock after the
+    change: a repeated hour is not waited out and a skipped hour is not scheduled."""
+    due = timestamp + seconds_to_multiple(datetime.fromtimestamp(timestamp), inclusive=False)
+    change = offset_change(timestamp, due)
+    if change is None:
+        return due
+    return change + seconds_to_multiple(datetime.fromtimestamp(change), inclusive=True)
 
 def wait_until(timestamp):
     """Wait until the wall clock reaches timestamp; False if stop_event was set first.
