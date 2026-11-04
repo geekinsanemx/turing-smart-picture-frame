@@ -7,7 +7,8 @@ The display communication code in `library/` comes from [turing-smart-screen-pyt
 ## Features
 
 - Landscape images are cropped to fill the screen; portrait images are shown in pairs side by side
-- Random rotation every `IMAGE_ROTATION_INTERVAL` seconds (default 30)
+- Random rotation every `--interval` seconds (default 30), aligned to the clock (see [Clock-aligned rotation](#clock-aligned-rotation))
+- Optional periodic rescan of the images directory (`--auto-refresh`)
 - Time (refreshed every second), date and day of week overlay in the bottom right corner
 - Optional recursive search of the images directory
 - Gradient default background when no images are found
@@ -58,7 +59,7 @@ python3 -m venv .venv
 
 ```bash
 turing-smart-picture-frame [--images PATH] [--recursive] [--preload-images N] [--interval SEC]
-                           [--font NAME|PATH] [--font-list] [--time-size N] [--date-size N] [--day-size N]
+                           [--auto-refresh [SEC]] [--font NAME|PATH] [--font-list] [--time-size N] [--date-size N] [--day-size N]
                            [--revision {A,B,C,D,SIMU}] [--port PORT] [--brightness 0-100]
                            [--text-contrast MODE] [--scale-mode MODE] [--max-crop PCT]
                            [--min-coverage PCT] [--cache-size MB] [--debug]
@@ -69,7 +70,8 @@ turing-smart-picture-frame [--images PATH] [--recursive] [--preload-images N] [-
 | `--images PATH` | Images directory (default: `images` in the current directory) |
 | `--recursive` | Search images in subdirectories |
 | `--preload-images N` | Use only N random images of the discovered ones; a new random sample is taken once all of them have been shown. Only the sampled images are opened, so startup stays fast with thousands of images (default: `0` = no limit) |
-| `--interval SEC` | Seconds between image changes (default: `30`) |
+| `--interval SEC` | Seconds between image changes, at multiples of SEC counted from local midnight (default: `30`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
+| `--auto-refresh [SEC]` | Rescan the images directory every SEC seconds for new or deleted images, without interrupting the slideshow; without a value every `3600` (default: no rescan, see [Auto refresh](#auto-refresh)) |
 | `--font NAME\|PATH` | Font for the time/date overlay: a bundled font name (see [Fonts](#fonts), case-insensitive) or the path to a custom `.ttf`/`.otf` file (default: `dejavu`) |
 | `--font-list` | List the bundled fonts usable as `--font NAME` and exit |
 | `--time-size N` / `--date-size N` / `--day-size N` | Overlay font sizes (default: `34` / `22` / `24`) |
@@ -91,7 +93,7 @@ Example:
 
 ```bash
 turing-smart-picture-frame --images ~/Pictures --recursive --preload-images 100 --interval 60 \
-    --font dancingscript --brightness 30
+    --auto-refresh --font dancingscript --brightness 30
 
 # custom font: give its path
 turing-smart-picture-frame --images ~/Pictures --font ~/fonts/MyFont.ttf
@@ -99,7 +101,33 @@ turing-smart-picture-frame --images ~/Pictures --font ~/fonts/MyFont.ttf
 
 Supported formats: PNG, JPG/JPEG, BMP, GIF. Press Ctrl+C to exit.
 
-Defaults are set at the top of `turing_smart_picture_frame.py`: `COM_PORT`, `REVISION`, `IMAGE_ROTATION_INTERVAL`, `PRELOAD_IMAGES`, `BRIGHTNESS`, `CACHE_DIR`, `CACHE_SIZE_MB`, `TIME_STYLE`/`DATE_STYLE`/`DAY_STYLE` (size, color on dark and on light backgrounds), `TEXT_CONTRAST`, `OUTLINE_WIDTH`, `BOX_ALPHA`, `SCALE_MODE`, `MAX_CROP`, `MIN_COVERAGE`, `BLUR_RADIUS`, `BLUR_BRIGHTNESS`, `OVERLAY_MARGIN`, `OVERLAY_LINE_GAP`, `WIDTH`/`HEIGHT`. When installed, re-run `pipx install --force .` after changing them.
+Defaults are set at the top of `turing_smart_picture_frame.py`: `COM_PORT`, `REVISION`, `IMAGE_ROTATION_INTERVAL`, `AUTO_REFRESH`, `AUTO_REFRESH_DEFAULT`, `PRELOAD_IMAGES`, `BRIGHTNESS`, `CACHE_DIR`, `CACHE_SIZE_MB`, `TIME_STYLE`/`DATE_STYLE`/`DAY_STYLE` (size, color on dark and on light backgrounds), `TEXT_CONTRAST`, `OUTLINE_WIDTH`, `BOX_ALPHA`, `SCALE_MODE`, `MAX_CROP`, `MIN_COVERAGE`, `BLUR_RADIUS`, `BLUR_BRIGHTNESS`, `OVERLAY_MARGIN`, `OVERLAY_LINE_GAP`, `WIDTH`/`HEIGHT`. When installed, re-run `pipx install --force .` after changing them.
+
+### Clock-aligned rotation
+
+The first image is shown at startup. Every following change happens at the next multiple of `--interval` seconds counted from local midnight:
+
+| `--interval` | Changes at |
+|---|---|
+| `30` | every `:00` and `:30` second |
+| `60` | every `HH:MM:00` |
+| `900` | `:00`, `:15`, `:30`, `:45` of every hour |
+| `3600` | every `HH:00:00` |
+
+Started at 10:15:20 with `--interval 30`, the first change is at 10:15:30, then 10:16:00, and so on. An interval that does not divide 24 hours (e.g. `7`) is realigned at 00:00:00 every day, which also refreshes the date overlay at midnight.
+
+The next image is prepared before its change time and the clock is drawn on whole seconds, so the new image starts drawing at the exact second (sending it to the display takes a fraction of a second, depending on the hardware revision). If preparing an image takes longer than the time left, it is shown at the following change time.
+
+### Auto refresh
+
+`--auto-refresh [SEC]` rescans the images directory every SEC seconds (every hour when given without a value) in a separate thread; the clock and the rotation keep running during the scan.
+
+- New images are added to the end of the rotation queue; deleted images are removed from it
+- With `--preload-images`, deleted images leave the current sample and new images can enter the next sample
+- Only new or modified files are opened; the orientation of known images is remembered
+- If all images are removed, the default background is shown until images are added again
+- If the images directory is not accessible (e.g. an unmounted network share), the current images are kept
+- The image prepared for the next change was selected before the rescan, so changes take effect from the change after it
 
 ### Image scaling
 

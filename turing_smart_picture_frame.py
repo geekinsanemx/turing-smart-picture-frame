@@ -3,6 +3,14 @@
 # Based on turing-smart-screen-python library
 #
 # Changelog:
+# 1.0.13 - Image changes aligned to the clock: the first image is shown at startup, every following change
+#          happens at a multiple of --interval seconds counted from local midnight (interval 30 -> :00 and
+#          :30, 3600 -> X:00:00), realigned at 00:00:00 every day. The next image is prepared before its
+#          change time, and the main loop draws on whole seconds, so the change starts on time.
+#          --auto-refresh [SEC] (default 3600 when given without a value) rescans the source directory in
+#          its own thread: new images join the end of the rotation queue, deleted ones leave it, without
+#          interrupting the clock or the rotation. Orientation of each image is remembered per
+#          (path, mtime, size), so a rescan only opens new or modified files
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
 #          command line option with its value, including defaults, plus the cache directory and log file.
 #          The scattered startup lines for the cache, log file, rotation interval, source directory and
@@ -57,7 +65,9 @@ It supports both portrait and landscape images, automatically resizing and forma
 to fit the display. Portrait images are displayed in pairs side-by-side.
 
 Features:
-- Automatic image rotation at configurable intervals
+- Automatic image rotation at configurable intervals, aligned to the clock (multiples of the interval
+  counted from local midnight)
+- Optional periodic rescan of the source directory (--auto-refresh)
 - Support for multiple display hardware revisions (A, B, C, D, SIMU)
 - Time and date overlay on displayed images
 - Recursive directory searching for images
@@ -71,7 +81,9 @@ Configuration:
    --font NAME|PATH: Font for the time/date overlay: bundled font name (folder name in
                    res/fonts, e.g. pacifico) or path to a custom .ttf/.otf (default: dejavu)
    --font-list   : List the bundled fonts usable as --font NAME and exit
-   --interval SEC: Seconds between image changes (default: 30)
+   --interval SEC: Seconds between image changes, aligned to multiples of SEC from local midnight (default: 30)
+   --auto-refresh [SEC]: Rescan the images directory every SEC seconds (default when given without
+                   a value: 3600; not given = no rescan)
    --preload-images N: Use only N random images of the discovered ones, re-sampled after
                    all of them have been shown (default: 0 = no limit)
    --revision REV: Display hardware revision: A, B, C, D or SIMU (default: A)
@@ -86,6 +98,7 @@ Configuration:
 
 2. Hardcoded Configuration (modify in code; defaults of the options above):
    - COM_PORT, REVISION, IMAGE_ROTATION_INTERVAL, PRELOAD_IMAGES, BRIGHTNESS, CACHE_SIZE_MB
+   - AUTO_REFRESH (None = disabled), AUTO_REFRESH_DEFAULT (--auto-refresh without a value)
    - CACHE_DIR: processed images cache ($XDG_CACHE_HOME/tspf, default ~/.cache/tspf)
    - TIME_STYLE, DATE_STYLE, DAY_STYLE: overlay (font size, color on dark bg, color on light bg)
    - TEXT_CONTRAST, OUTLINE_WIDTH, BOX_ALPHA: overlay contrast mode, outline px, box opacity
@@ -120,9 +133,15 @@ Notes:
   screen is written to $XDG_CACHE_HOME/tspf/simu/screencap.png. Nothing is written to the current directory.
 - At startup the effective configuration is logged: every option with its value, defaults included,
   plus the cache directory and log file.
+- The first image is shown at startup; the next ones change at the next multiple of --interval seconds
+  from local midnight. An interval that does not divide 24 h is realigned at 00:00:00 every day.
+- --auto-refresh adds new images to the end of the rotation queue and removes deleted ones; with
+  --preload-images new images enter the next random sample. If the images directory is not accessible
+  during a rescan, the current images are kept.
 """
 
 import os
+import math
 import signal
 import sys
 import time
@@ -131,10 +150,10 @@ import argparse
 import calendar
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib.resources import files
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 # Import LCD communication modules
 from library.lcd.lcd_comm_rev_a import LcdCommRevA, Orientation
@@ -144,14 +163,17 @@ from library.lcd.lcd_comm_rev_d import LcdCommRevD
 from library.lcd.lcd_simulated import LcdSimulated
 from library.log import APP_DIR, LOG_FILE, logger
 
-__version__ = "1.0.12"
+__version__ = "1.0.13"
 
 # Configuration (defaults of the command line options)
 COM_PORT = "AUTO"  # Set your COM port or "AUTO" for auto-discovery
 REVISION = "A"     # Display revision (A, B, C, D, or SIMU)
 REVISIONS = ("A", "B", "C", "D", "SIMU")
 WIDTH, HEIGHT = 320, 480  # Display dimensions in portrait mode
-IMAGE_ROTATION_INTERVAL = 30  # Seconds between background changes
+IMAGE_ROTATION_INTERVAL = 30  # Seconds between background changes, aligned to multiples from local midnight
+SECONDS_PER_DAY = 86400
+AUTO_REFRESH = None           # Seconds between rescans of the images directory, None = disabled
+AUTO_REFRESH_DEFAULT = 3600   # Rescan period of --auto-refresh given without a value
 PRELOAD_IMAGES = 0  # Random sample size of discovered images, 0 = no limit
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif"}
 BRIGHTNESS = 50    # Display brightness 0-100
@@ -229,6 +251,7 @@ def log_error(message):
 
 # Global variables
 stop_event = Event()
+wake_event = Event()
 lcd_comm = None
 current_background = None
 last_background = None
@@ -323,6 +346,8 @@ class ImageManager:
         self.landscape_images = []
         self.shown_images = set()
         self.current_index = 0
+        self.orientations = {}
+        self.lock = Lock()
         self.load_images()
 
     def load_images(self):
@@ -364,6 +389,70 @@ class ImageManager:
                 if not name.startswith('.') and os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
                     yield os.path.join(root, name)
 
+    def rescan(self):
+        """Scan the source directory again and apply added/removed images to the rotation queue.
+
+        Scanning and opening new images happen outside the lock, so the rotation thread is only
+        held for the final list update. New images go to the end of their queue (in the next sample
+        with --preload-images), deleted images leave it. An inaccessible directory keeps the current images."""
+        if not os.path.isdir(self.source_images_dir):
+            log_warning(f"Auto refresh: {self.source_images_dir} is not accessible, keeping the current images")
+            return
+        discovered = list(self.find_images())
+        with self.lock:
+            pool = self.rotation_pool(discovered)
+        for image_path in pool:
+            self.orientation(image_path)
+
+        with self.lock:
+            previous = set(self.discovered_images)
+            current = set(discovered)
+            self.discovered_images = discovered
+            self.orientations = {key: kind for key, kind in self.orientations.items() if key[0] in current}
+            added, removed = len(current - previous), len(previous - current)
+
+            if not discovered:
+                if previous:
+                    log_warning(f"Auto refresh: no images left in {self.source_images_dir}")
+                    self.image_list = []
+                    self.portrait_images = []
+                    self.create_default_image()
+                return
+
+            pool = self.rotation_pool(discovered)
+            kinds = {image_path: self.orientation(image_path) for image_path in pool}
+            portraits = {image_path for image_path, kind in kinds.items() if kind == "portrait"}
+            landscapes = {image_path for image_path, kind in kinds.items() if kind == "landscape"}
+            queued = set(self.portrait_images + self.landscape_images)
+            self.portrait_images = ([p for p in self.portrait_images if p in portraits]
+                                    + [p for p in pool if p in portraits and p not in queued])
+            self.landscape_images = ([p for p in self.landscape_images if p in landscapes or p in portraits]
+                                     + [p for p in pool if p in landscapes and p not in queued])
+            self.image_list = pool
+            self.balance_portraits(portraits)
+
+            if added or removed:
+                log_info(f"Auto refresh: {len(discovered)} images discovered (+{added}, -{removed}), "
+                         f"{len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape in rotation")
+            else:
+                log_debug("Auto refresh: no changes")
+
+    def rotation_pool(self, discovered):
+        """Images eligible for the rotation: all discovered, or the current sample still present"""
+        if 0 < self.preload_images < len(discovered):
+            present = set(discovered)
+            return [image_path for image_path in self.image_list if image_path in present]
+        return list(discovered)
+
+    def balance_portraits(self, portraits):
+        """A lone portrait can never form a pair: show it full screen, and pair it again once a partner exists"""
+        lone = [image_path for image_path in self.landscape_images if image_path in portraits]
+        if lone and self.portrait_images:
+            self.landscape_images = [image_path for image_path in self.landscape_images if image_path not in portraits]
+            self.portrait_images.extend(lone)
+        if len(self.portrait_images) == 1 and self.landscape_images:
+            self.landscape_images.append(self.portrait_images.pop())
+
     def is_sampled(self):
         """True when --preload-images limits the discovered images to a random sample"""
         return 0 < self.preload_images < len(self.discovered_images)
@@ -379,9 +468,7 @@ class ImageManager:
 
         # Categorize images by orientation
         self.categorize_images_by_orientation()
-        # A lone portrait can never form a pair: show it full screen like get_next_image does
-        if len(self.portrait_images) == 1 and self.landscape_images:
-            self.landscape_images.append(self.portrait_images.pop())
+        self.balance_portraits(set(self.portrait_images))
         # Shuffle both lists for random order
         random.shuffle(self.portrait_images)
         random.shuffle(self.landscape_images)
@@ -399,29 +486,47 @@ class ImageManager:
 
         skipped = 0
         for image_path in self.image_list:
-            try:
-                with Image.open(image_path) as img:
-                    width, height = img.size
-                    portrait = height > width
-                    # Portraits are shown in pairs, each one in half of the screen
-                    target_width = self.display_width // 2 if portrait else self.display_width
-                    coverage = self.coverage(width, height, target_width, self.display_height)
-                    if coverage < MIN_COVERAGE / 100:
-                        skipped += 1
-                        log_debug(f"Skipped: {os.path.basename(image_path)} ({width}x{height}) would cover "
-                                  f"{coverage:.0%} of its area, below --min-coverage {MIN_COVERAGE}%")
-                    elif portrait:
-                        self.portrait_images.append(image_path)
-                        log_debug(f"Portrait: {os.path.basename(image_path)} ({width}x{height})")
-                    else:
-                        self.landscape_images.append(image_path)
-                        log_debug(f"Landscape: {os.path.basename(image_path)} ({width}x{height})")
-            except Exception as e:
-                log_error(f"Error reading image {image_path}: {e}")
-                continue
+            kind = self.orientation(image_path)
+            if kind == "portrait":
+                self.portrait_images.append(image_path)
+            elif kind == "landscape":
+                self.landscape_images.append(image_path)
+            elif kind == "skipped":
+                skipped += 1
 
         log_info(f"Categorized images: {len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape"
                  + (f", {skipped} skipped (below --min-coverage {MIN_COVERAGE}%)" if skipped else ""))
+
+    def orientation(self, image_path):
+        """portrait, landscape, skipped (below --min-coverage) or error; read once per (path, mtime, size)"""
+        try:
+            stat = os.stat(image_path)
+        except OSError as e:
+            log_error(f"Error reading image {image_path}: {e}")
+            return "error"
+        key = (image_path, stat.st_mtime_ns, stat.st_size)
+        if key not in self.orientations:
+            self.orientations[key] = self.read_orientation(image_path)
+        return self.orientations[key]
+
+    def read_orientation(self, image_path):
+        """Open image_path and classify it for the rotation"""
+        try:
+            with Image.open(image_path) as img:
+                width, height = img.size
+        except Exception as e:
+            log_error(f"Error reading image {image_path}: {e}")
+            return "error"
+        portrait = height > width
+        # Portraits are shown in pairs, each one in half of the screen
+        target_width = self.display_width // 2 if portrait else self.display_width
+        coverage = self.coverage(width, height, target_width, self.display_height)
+        if coverage < MIN_COVERAGE / 100:
+            log_debug(f"Skipped: {os.path.basename(image_path)} ({width}x{height}) would cover "
+                      f"{coverage:.0%} of its area, below --min-coverage {MIN_COVERAGE}%")
+            return "skipped"
+        log_debug(f"{'Portrait' if portrait else 'Landscape'}: {os.path.basename(image_path)} ({width}x{height})")
+        return "portrait" if portrait else "landscape"
 
     def create_default_image(self):
         """Create a default gradient background if no images are found"""
@@ -580,7 +685,20 @@ class ImageManager:
         return canvas
 
     def get_next_image(self):
-        """Get the next processed image for display with 50/50 probability between portrait pairs and landscape"""
+        """Get the next processed image for display with 50/50 probability between portrait pairs and landscape.
+
+        The queues are only locked while choosing the source images; processing runs unlocked, so a
+        concurrent rescan never waits for it."""
+        with self.lock:
+            selection = self.select_next()
+        if not selection:
+            return None
+        if len(selection) == 2:
+            return self.resize_portrait_pair(*selection)
+        return self.resize_landscape_single(selection[0])
+
+    def select_next(self):
+        """Advance the rotation queues: (portrait1, portrait2) for a pair, (image,) for a single image, or None"""
         if self.sample_exhausted():
             log_info("All images of the current sample have been shown, selecting a new sample")
             self.select_sample()
@@ -619,7 +737,7 @@ class ImageManager:
             img = self.portrait_images.pop(0)
             self.portrait_images.append(img)
             self.shown_images.add(img)
-            return self.resize_landscape_single(img)
+            return (img,)
 
         return None
 
@@ -633,7 +751,7 @@ class ImageManager:
         self.portrait_images.extend([img1, img2])
         self.shown_images.update([img1, img2])
 
-        return self.resize_portrait_pair(img1, img2)
+        return img1, img2
 
     def _get_landscape_single(self):
         """Helper method to get a landscape image"""
@@ -644,7 +762,7 @@ class ImageManager:
         self.landscape_images.append(img)
         self.shown_images.add(img)
 
-        return self.resize_landscape_single(img)
+        return (img,)
 
 def initialize_display():
     """Initialize the LCD communication"""
@@ -808,34 +926,83 @@ def display_slideshow_content(background_image, force_background_refresh=False):
         import traceback
         logger.debug(f"Traceback: {traceback.format_exc()}")
 
+def next_transition(timestamp):
+    """First instant after timestamp at a multiple of IMAGE_ROTATION_INTERVAL seconds from local midnight.
+
+    Intervals up to one day are capped at the next midnight, so every day starts aligned at 00:00:00."""
+    midnight = datetime.fromtimestamp(timestamp).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = midnight.timestamp()
+    steps = math.floor((timestamp - start) / IMAGE_ROTATION_INTERVAL) + 1
+    due = start + steps * IMAGE_ROTATION_INTERVAL
+    if IMAGE_ROTATION_INTERVAL <= SECONDS_PER_DAY:
+        due = min(due, (midnight + timedelta(days=1)).timestamp())
+    return due
+
+def wait_until(timestamp):
+    """Wait until the wall clock reaches timestamp; False if stop_event was set first.
+
+    Waits at most a minute at a time, so a wall clock adjustment (NTP) moves the deadline with it."""
+    while (remaining := timestamp - time.time()) > 0:
+        if stop_event.wait(min(remaining, 60)):
+            return False
+    return True
+
 def background_rotation_thread(image_manager):
-    """Thread function for rotating background images"""
+    """Thread function for rotating background images on the clock schedule of next_transition.
+
+    The next image is prepared first, then shown at its transition time; when preparing it takes
+    longer than that, it is shown at the following one."""
     global current_background
 
     log_debug("Background rotation thread started")
 
-    while not stop_event.wait(IMAGE_ROTATION_INTERVAL):
+    due = time.time()
+    while not stop_event.is_set():
+        new_background = None
         try:
             log_debug("Getting next background image...")
             new_background = image_manager.get_next_image()
-            if new_background:
-                current_background = new_background
-                log_info(f"Switched to background: {os.path.basename(new_background)}")
-                log_debug(f"Full path: {new_background}")
-            else:
-                log_warning("Failed to get next background image")
         except Exception as e:
             log_error(f"Error in background rotation: {e}")
             log_debug(f"Exception details: {type(e).__name__}: {str(e)}")
             import traceback
             log_debug(f"Traceback: {traceback.format_exc()}")
 
+        due = next_transition(max(due, time.time()))
+        log_debug(f"Next background change at {datetime.fromtimestamp(due):%Y-%m-%d %H:%M:%S}")
+        if not wait_until(due):
+            break
+        if new_background:
+            current_background = new_background
+            wake_event.set()
+            log_info(f"Switched to background: {os.path.basename(new_background)}")
+            log_debug(f"Full path: {new_background}")
+        else:
+            log_warning("Failed to get next background image")
+
     log_debug("Background rotation thread stopped")
+
+def source_refresh_thread(image_manager):
+    """Thread function rescanning the images directory every AUTO_REFRESH seconds"""
+    log_debug("Source refresh thread started")
+
+    while not stop_event.wait(AUTO_REFRESH):
+        try:
+            log_debug("Rescanning images directory...")
+            image_manager.rescan()
+        except Exception as e:
+            log_error(f"Error in auto refresh: {e}")
+            log_debug(f"Exception details: {type(e).__name__}: {str(e)}")
+            import traceback
+            log_debug(f"Traceback: {traceback.format_exc()}")
+
+    log_debug("Source refresh thread stopped")
 
 def sighandler(signum, frame):
     """Signal handler for graceful shutdown"""
     log_info("Received shutdown signal")
     stop_event.set()
+    wake_event.set()
 
 def bundled_fonts():
     """Bundled fonts in res/fonts: {name (folder name, lowercase): (font file path, license file name)}"""
@@ -908,7 +1075,13 @@ def parse_arguments():
     parser.add_argument("--font-list", action="store_true",
                        help="List the bundled fonts usable as --font NAME and exit")
     parser.add_argument("--interval", type=int_range(1), default=IMAGE_ROTATION_INTERVAL, metavar="SEC",
-                       help=f"Seconds between image changes (default: {IMAGE_ROTATION_INTERVAL})")
+                       help="Seconds between image changes; changes happen at multiples of SEC counted from "
+                            f"local midnight, e.g. 30 = at :00 and :30 (default: {IMAGE_ROTATION_INTERVAL})")
+    parser.add_argument("--auto-refresh", type=int_range(1), nargs="?", const=AUTO_REFRESH_DEFAULT,
+                       default=AUTO_REFRESH, metavar="SEC",
+                       help="Rescan the images directory every SEC seconds for new or deleted images, without "
+                            f"interrupting the slideshow; without a value every {AUTO_REFRESH_DEFAULT} "
+                            "(default: no rescan)")
     parser.add_argument("--preload-images", type=int_range(0), default=PRELOAD_IMAGES, metavar="N",
                        help="Use only N random images of the discovered ones, re-sampled after all of them "
                             f"have been shown; 0 = no limit (default: {PRELOAD_IMAGES})")
@@ -958,7 +1131,7 @@ def main():
     """Main slideshow function"""
     global current_background, VERBOSE_LEVEL, FONT_PATH, overlay
     global IMAGE_ROTATION_INTERVAL, REVISION, COM_PORT, BRIGHTNESS, TIME_STYLE, DATE_STYLE, DAY_STYLE
-    global TEXT_CONTRAST, SCALE_MODE, MAX_CROP, MIN_COVERAGE
+    global TEXT_CONTRAST, SCALE_MODE, MAX_CROP, MIN_COVERAGE, AUTO_REFRESH
 
     # Parse command line arguments
     args = parse_arguments()
@@ -967,6 +1140,7 @@ def main():
         return
     FONT_PATH = args.font
     IMAGE_ROTATION_INTERVAL = args.interval
+    AUTO_REFRESH = args.auto_refresh
     REVISION = args.revision
     COM_PORT = args.port
     BRIGHTNESS = args.brightness
@@ -988,6 +1162,9 @@ def main():
 
     configure_logging(VERBOSE_LEVEL)
     log_configuration(args)
+    if SECONDS_PER_DAY % IMAGE_ROTATION_INTERVAL:
+        log_warning(f"--interval {IMAGE_ROTATION_INTERVAL} does not divide 24 h: image changes are realigned "
+                    "at 00:00:00 every day")
 
     # Set up signal handlers
     signal.signal(signal.SIGINT, sighandler)
@@ -1019,6 +1196,9 @@ def main():
                           daemon=True)
         bg_thread.start()
 
+        if AUTO_REFRESH:
+            Thread(target=source_refresh_thread, args=(image_manager,), daemon=True).start()
+
         # Main display loop
         frame_count = 0
         log_info("Starting image slideshow (Press Ctrl+C to exit)")
@@ -1027,33 +1207,16 @@ def main():
                  f"{len(image_manager.discovered_images)} discovered")
 
         while not stop_event.is_set():
-            start_time = time.perf_counter()
-
+            wake_event.clear()
             try:
-                # Check if we need to force refresh (new background)
-                force_refresh = (frame_count == 0 or last_background != current_background)
-
-                # Display slideshow content (only refreshes background when changed)
-                display_slideshow_content(current_background, force_refresh)
-
+                display_slideshow_content(current_background, frame_count == 0)
                 frame_count += 1
-
-                # Performance monitoring (less frequent)
-                end_time = time.perf_counter()
-                refresh_time = end_time - start_time
-
-                # Target refresh rate - very relaxed 1 FPS
-                target_fps = 1  # 1 FPS - updates once per second
-                target_time = 1.0 / target_fps
-                sleep_time = max(0.8, target_time - refresh_time)  # Minimum 0.8s sleep
-                time.sleep(sleep_time)
-
             except Exception as e:
                 log_error(f"Error in main loop: {e}")
                 log_debug(f"Frame {frame_count} failed - Exception details: {type(e).__name__}: {str(e)}")
                 import traceback
                 log_debug(f"Traceback: {traceback.format_exc()}")
-                time.sleep(1)  # Wait before retrying
+            wake_event.wait(1 - time.time() % 1)
 
         log_info("Image slideshow stopped")
 
