@@ -25,7 +25,8 @@
 #          --images must be an existing, readable directory: otherwise the program exits with an argument
 #          error instead of creating it (not checked with --font-list, which needs no images).
 #          A new --preload-images sample is drawn under the rotation lock but classified outside it;
-#          it is reconciled with current discovery in one pass, so repeated rescans cannot starve rotation
+#          it is reconciled with current discovery in one pass, so repeated rescans cannot starve rotation.
+#          Refreshed queues are retained when sampling is no longer needed or all candidates disappear
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
 #          command line option with its value, including defaults, plus the cache directory and log file.
 #          The scattered startup lines for the cache, log file, rotation interval, source directory and
@@ -788,7 +789,9 @@ class ImageManager:
                     return self.default_background
                 present = set(self.discovered_images)
                 candidates = [path for path in candidates if path in present]
-                messages = self.apply_sample(candidates, kinds)
+                messages = []
+                if self.is_sampled() and candidates:
+                    messages = self.apply_sample(candidates, kinds)
                 selection = self.select_next()
             for log, message in messages:
                 log(message)
