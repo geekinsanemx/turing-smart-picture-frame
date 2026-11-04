@@ -23,7 +23,8 @@
 #          every rescan. The rescan touches the filesystem only outside the rotation lock. The fallback
 #          background is retained in memory rather than queued as an evictable cache-file source.
 #          --images must be an existing, readable directory: otherwise the program exits with an argument
-#          error instead of creating it (not checked with --font-list, which needs no images)
+#          error instead of creating it (not checked with --font-list, which needs no images).
+#          A new --preload-images sample is drawn under the rotation lock but classified outside it
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
 #          command line option with its value, including defaults, plus the cache directory and log file.
 #          The scattered startup lines for the cache, log file, rotation interval, source directory and
@@ -378,6 +379,7 @@ class ImageManager:
         self.read_errors = set()
         self.sample_generation = 0
         self.lock = Lock()
+        self.memo_lock = Lock()
         self.load_images()
 
     def load_images(self):
@@ -450,8 +452,10 @@ class ImageManager:
         previous = set(self.discovered_images)
         current = set(discovered)
         self.discovered_images = discovered
-        self.orientations = {key: kind for key, kind in self.orientations.items() if key[0] in current}
-        self.read_errors &= current
+        self.sample_generation += 1
+        with self.memo_lock:
+            self.orientations = {key: kind for key, kind in self.orientations.items() if key[0] in current}
+            self.read_errors &= current
         added, removed = len(current - previous), len(previous - current)
 
         if not discovered:
@@ -510,21 +514,38 @@ class ImageManager:
         return 0 < self.preload_images < len(self.discovered_images)
 
     def select_sample(self):
-        """Pick the images to rotate (a random sample of preload_images, or all) and categorize them"""
+        """Pick and categorize the images to rotate in one step (startup, before other threads exist)"""
+        candidates = self.draw_sample()
+        kinds = {image_path: self.orientation(image_path) for image_path in candidates}
+        for log, message in self.apply_sample(candidates, kinds):
+            log(message)
+
+    def draw_sample(self):
+        """Images for the next rotation: a random sample of preload_images, or all discovered (no filesystem access)"""
         if self.is_sampled():
-            self.image_list = random.sample(self.discovered_images, self.preload_images)
-            log_info(f"Selected random sample of {self.preload_images} of {len(self.discovered_images)} images")
-        else:
-            self.image_list = list(self.discovered_images)
+            return random.sample(self.discovered_images, self.preload_images)
+        return list(self.discovered_images)
+
+    def apply_sample(self, candidates, kinds):
+        """Install candidates, classified in kinds, as the rotation (no filesystem access, not even logging,
+        so it can run under the lock). Returns [(log function, message)] for the caller to log."""
+        self.image_list = candidates
         self.shown_images = set()
         self.sample_generation += 1
-
-        # Categorize images by orientation
-        self.categorize_images_by_orientation()
+        self.portrait_images = [p for p in candidates if kinds[p] == "portrait"]
+        self.landscape_images = [p for p in candidates if kinds[p] == "landscape"]
+        skipped = sum(1 for p in candidates if kinds[p] == "skipped")
         self.balance_portraits(set(self.portrait_images))
-        # Shuffle both lists for random order
         random.shuffle(self.portrait_images)
         random.shuffle(self.landscape_images)
+        messages = []
+        if self.is_sampled():
+            messages.append((log_info, f"Selected random sample of {self.preload_images} of "
+                                       f"{len(self.discovered_images)} images"))
+        messages.append((log_info, f"Categorized images: {len(self.portrait_images)} portrait, "
+                                   f"{len(self.landscape_images)} landscape"
+                                   + (f", {skipped} skipped (below --min-coverage {MIN_COVERAGE}%)" if skipped else "")))
+        return messages
 
     def sample_exhausted(self):
         """True when every image of the current random sample has been shown"""
@@ -532,26 +553,9 @@ class ImageManager:
             return False
         return self.shown_images.issuperset(self.portrait_images + self.landscape_images)
 
-    def categorize_images_by_orientation(self):
-        """Categorize images into portrait and landscape lists"""
-        self.portrait_images = []
-        self.landscape_images = []
-
-        skipped = 0
-        for image_path in self.image_list:
-            kind = self.orientation(image_path)
-            if kind == "portrait":
-                self.portrait_images.append(image_path)
-            elif kind == "landscape":
-                self.landscape_images.append(image_path)
-            elif kind == "skipped":
-                skipped += 1
-
-        log_info(f"Categorized images: {len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape"
-                 + (f", {skipped} skipped (below --min-coverage {MIN_COVERAGE}%)" if skipped else ""))
-
     def orientation(self, image_path):
-        """portrait, landscape, skipped (below --min-coverage) or error.
+        """portrait, landscape, skipped (below --min-coverage) or error. Called without self.lock, from the
+        rotation and refresh threads; the memo is guarded by self.memo_lock, never held during I/O.
 
         Successful classifications are remembered per (path, mtime, size); errors are not, so an image
         that becomes readable again (e.g. restored permissions) is classified on the next call. A read
@@ -559,17 +563,20 @@ class ImageManager:
         try:
             stat = os.stat(image_path)
             key = (image_path, stat.st_mtime_ns, stat.st_size)
-            if key not in self.orientations:
-                self.orientations[key] = self.read_orientation(image_path)
-            kind = self.orientations[key]
+            with self.memo_lock:
+                kind = self.orientations.get(key)
+            if kind is None:
+                kind = self.read_orientation(image_path)
+                with self.memo_lock:
+                    self.orientations[key] = kind
         except Exception as e:
-            if image_path in self.read_errors:
-                log_debug(f"Error reading image {image_path}: {e}")
-            else:
+            with self.memo_lock:
+                first = image_path not in self.read_errors
                 self.read_errors.add(image_path)
-                log_error(f"Error reading image {image_path}: {e}")
+            (log_error if first else log_debug)(f"Error reading image {image_path}: {e}")
             return "error"
-        self.read_errors.discard(image_path)
+        with self.memo_lock:
+            self.read_errors.discard(image_path)
         return kind
 
     def read_orientation(self, image_path):
@@ -766,11 +773,30 @@ class ImageManager:
         """Get the next processed image for display with 50/50 probability between portrait pairs and landscape.
 
         The queues are only locked while choosing the source images; processing runs unlocked, so a
-        concurrent rescan never waits for it."""
-        with self.lock:
-            if self.default_background is not None:
-                return self.default_background
-            selection = self.select_next()
+        concurrent rescan never waits for it. When the sample is exhausted, the new sample is drawn under
+        the lock but classified outside it, then installed only if no rescan changed the images meanwhile
+        (otherwise it is drawn again)."""
+        while True:
+            with self.lock:
+                if self.default_background is not None:
+                    return self.default_background
+                if not self.sample_exhausted():
+                    selection = self.select_next()
+                    break
+                generation = self.sample_generation
+                candidates = self.draw_sample()
+            log_info("All images of the current sample have been shown, selecting a new sample")
+            kinds = {image_path: self.orientation(image_path) for image_path in candidates}
+            with self.lock:
+                messages = None
+                if generation == self.sample_generation:
+                    messages = self.apply_sample(candidates, kinds)
+                    selection = self.select_next()
+            if messages is not None:
+                for log, message in messages:
+                    log(message)
+                break
+            log_debug("The images changed while selecting a new sample, selecting again")
         if not selection:
             return None
         if len(selection) == 2:
@@ -779,10 +805,6 @@ class ImageManager:
 
     def select_next(self):
         """Advance the rotation queues: (portrait1, portrait2) for a pair, (image,) for a single image, or None"""
-        if self.sample_exhausted():
-            log_info("All images of the current sample have been shown, selecting a new sample")
-            self.select_sample()
-
         if not self.portrait_images and not self.landscape_images:
             return None
 
