@@ -59,7 +59,7 @@ python3 -m venv .venv
 
 ```bash
 turing-smart-picture-frame [--images PATH] [--recursive] [--preload-images N] [--interval DURATION]
-                           [--auto-refresh [SEC]] [--font NAME|PATH] [--font-list] [--time-size N] [--date-size N] [--day-size N]
+                           [--auto-refresh [DURATION]] [--font NAME|PATH] [--font-list] [--time-size N] [--date-size N] [--day-size N]
                            [--revision {A,B,C,D,SIMU}] [--port PORT] [--brightness 0-100]
                            [--text-contrast MODE] [--scale-mode MODE] [--max-crop PCT]
                            [--min-coverage PCT] [--cache-size MB] [--debug]
@@ -71,7 +71,7 @@ turing-smart-picture-frame [--images PATH] [--recursive] [--preload-images N] [-
 | `--recursive` | Search images in subdirectories |
 | `--preload-images N` | Use only N random images of the discovered ones; a new random sample is taken once all of them have been shown. Only the sampled images are opened, so startup stays fast with thousands of images (default: `0` = no limit) |
 | `--interval DURATION` | Time between image changes, at its multiples counted from local midnight: seconds or a number with unit `s`/`m`/`h`/`d` (`30`, `5m`, `1h`, `1d`); only round clock intervals from 5 s to 1 day are accepted (default: `30`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
-| `--auto-refresh [SEC]` | Rescan the images directory every SEC seconds for new or deleted images, without interrupting the slideshow; without a value every `3600` (default: no rescan, see [Auto refresh](#auto-refresh)) |
+| `--auto-refresh [DURATION]` | Rescan the images directory for new or deleted images every DURATION, without interrupting the slideshow: seconds or a number with unit `s`/`m`/`h`/`d` (`600`, `30m`, `2h`, `1d`); without a value every `1h` (default: no rescan, see [Auto refresh](#auto-refresh)) |
 | `--font NAME\|PATH` | Font for the time/date overlay: a bundled font name (see [Fonts](#fonts), case-insensitive) or the path to a custom `.ttf`/`.otf` file (default: `dejavu`) |
 | `--font-list` | List the bundled fonts usable as `--font NAME` and exit |
 | `--time-size N` / `--date-size N` / `--day-size N` | Overlay font sizes (default: `34` / `22` / `24`) |
@@ -133,7 +133,7 @@ Changes follow the local wall clock: across daylight saving changes the multiple
 
 ### Auto refresh
 
-`--auto-refresh [SEC]` rescans the images directory every SEC seconds (every hour when given without a value) in a separate thread; the clock and the rotation keep running during the scan.
+`--auto-refresh [DURATION]` rescans the images directory every DURATION (every hour when given without a value) in a separate thread; the clock and the rotation keep running during the scan. DURATION uses the same syntax as `--interval` (`600`, `30m`, `2h`, `1d`), but any value from 1 second is accepted, since rescans are not aligned to the clock.
 
 - New images are added to the end of the rotation queue; deleted images are removed from it
 - With `--preload-images`, deleted images leave the current sample and new images can enter the next sample

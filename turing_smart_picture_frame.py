@@ -12,7 +12,8 @@
 #          is prepared and loaded in memory before its change time (the main loop no longer reads the
 #          cache, so eviction cannot skip a change), and the main loop draws on whole seconds, so the
 #          change starts on time.
-#          --auto-refresh [SEC] (default 3600 when given without a value) rescans the source directory in
+#          --auto-refresh [DURATION] (seconds or s/m/h/d units like --interval, any value from 1 s; 1h
+#          when given without a value) rescans the source directory in
 #          its own thread: new images join the end of the rotation queue, deleted ones leave it, without
 #          interrupting the clock or the rotation. Orientation of each image is remembered per
 #          (path, mtime, size), so a rescan only opens new or modified files; an image whose orientation
@@ -93,8 +94,8 @@ Configuration:
    --interval DURATION: Time between image changes, aligned to its multiples from local midnight: seconds
                    or a number with unit s/m/h/d (e.g. 30, 5m, 1h, 1d); multiples of 5 s dividing an hour
                    or whole hours dividing a day (default: 30)
-   --auto-refresh [SEC]: Rescan the images directory every SEC seconds (default when given without
-                   a value: 3600; not given = no rescan)
+   --auto-refresh [DURATION]: Rescan the images directory every DURATION, seconds or a number with
+                   unit s/m/h/d (e.g. 600, 30m, 2h); default when given without a value: 1h; not given = no rescan
    --preload-images N: Use only N random images of the discovered ones, re-sampled after
                    all of them have been shown (default: 0 = no limit)
    --revision REV: Display hardware revision: A, B, C, D or SIMU (default: A)
@@ -1187,6 +1188,18 @@ def format_duration(seconds):
         if seconds % size == 0:
             return f"{seconds // size}{unit}"
 
+def duration_at_least(minimum):
+    """argparse type factory: duration (see parse_duration) of at least minimum seconds"""
+    def parse(value):
+        try:
+            seconds = parse_duration(value)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e))
+        if seconds < minimum:
+            raise argparse.ArgumentTypeError(f"'{value}' is shorter than {format_duration(minimum)}")
+        return seconds
+    return parse
+
 def rotation_interval(value):
     """argparse type: --interval as a duration (see parse_duration) that is one of ALLOWED_INTERVALS"""
     try:
@@ -1219,10 +1232,11 @@ def parse_arguments():
                             "at :00 and :30. Allowed: multiples of 5 s that divide an hour (5s ... 30m, 1h) or "
                             f"whole hours that divide a day (2h, 3h, 4h, 6h, 8h, 12h, 1d) "
                             f"(default: {IMAGE_ROTATION_INTERVAL})")
-    parser.add_argument("--auto-refresh", type=int_range(1), nargs="?", const=AUTO_REFRESH_DEFAULT,
-                       default=AUTO_REFRESH, metavar="SEC",
-                       help="Rescan the images directory every SEC seconds for new or deleted images, without "
-                            f"interrupting the slideshow; without a value every {AUTO_REFRESH_DEFAULT} "
+    parser.add_argument("--auto-refresh", type=duration_at_least(1), nargs="?", const=AUTO_REFRESH_DEFAULT,
+                       default=AUTO_REFRESH, metavar="DURATION",
+                       help="Rescan the images directory for new or deleted images every DURATION, without "
+                            "interrupting the slideshow: seconds or a number with unit s/m/h/d (e.g. 600, 30m, "
+                            f"2h, 1d); without a value every {format_duration(AUTO_REFRESH_DEFAULT)} "
                             "(default: no rescan)")
     parser.add_argument("--preload-images", type=int_range(0), default=PRELOAD_IMAGES, metavar="N",
                        help="Use only N random images of the discovered ones, re-sampled after all of them "
