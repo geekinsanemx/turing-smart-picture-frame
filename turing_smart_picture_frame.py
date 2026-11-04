@@ -24,7 +24,8 @@
 #          background is retained in memory rather than queued as an evictable cache-file source.
 #          --images must be an existing, readable directory: otherwise the program exits with an argument
 #          error instead of creating it (not checked with --font-list, which needs no images).
-#          A new --preload-images sample is drawn under the rotation lock but classified outside it
+#          A new --preload-images sample is drawn under the rotation lock but classified outside it;
+#          it is reconciled with current discovery in one pass, so repeated rescans cannot starve rotation
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
 #          command line option with its value, including defaults, plus the cache directory and log file.
 #          The scattered startup lines for the cache, log file, rotation interval, source directory and
@@ -452,7 +453,6 @@ class ImageManager:
         previous = set(self.discovered_images)
         current = set(discovered)
         self.discovered_images = discovered
-        self.sample_generation += 1
         with self.memo_lock:
             self.orientations = {key: kind for key, kind in self.orientations.items() if key[0] in current}
             self.read_errors &= current
@@ -770,33 +770,28 @@ class ImageManager:
         return canvas
 
     def get_next_image(self):
-        """Get the next processed image for display with 50/50 probability between portrait pairs and landscape.
-
-        The queues are only locked while choosing the source images; processing runs unlocked, so a
-        concurrent rescan never waits for it. When the sample is exhausted, the new sample is drawn under
-        the lock but classified outside it, then installed only if no rescan changed the images meanwhile
-        (otherwise it is drawn again)."""
-        while True:
-            with self.lock:
-                if self.default_background is not None:
-                    return self.default_background
-                if not self.sample_exhausted():
-                    selection = self.select_next()
-                    break
-                generation = self.sample_generation
+        """Choose sources under the lock, classify a replacement sample outside it, then reconcile it
+        with current discovery without retries. Processing also runs outside the lock."""
+        with self.lock:
+            if self.default_background is not None:
+                return self.default_background
+            replace_sample = self.sample_exhausted()
+            if replace_sample:
                 candidates = self.draw_sample()
+            else:
+                selection = self.select_next()
+        if replace_sample:
             log_info("All images of the current sample have been shown, selecting a new sample")
             kinds = {image_path: self.orientation(image_path) for image_path in candidates}
             with self.lock:
-                messages = None
-                if generation == self.sample_generation:
-                    messages = self.apply_sample(candidates, kinds)
-                    selection = self.select_next()
-            if messages is not None:
-                for log, message in messages:
-                    log(message)
-                break
-            log_debug("The images changed while selecting a new sample, selecting again")
+                if self.default_background is not None:
+                    return self.default_background
+                present = set(self.discovered_images)
+                candidates = [path for path in candidates if path in present]
+                messages = self.apply_sample(candidates, kinds)
+                selection = self.select_next()
+            for log, message in messages:
+                log(message)
         if not selection:
             return None
         if len(selection) == 2:
