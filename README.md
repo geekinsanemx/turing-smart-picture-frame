@@ -118,6 +118,8 @@ Started at 10:15:20 with `--interval 30`, the first change is at 10:15:30, then 
 
 The next image is prepared before its change time and the clock is drawn on whole seconds, so the new image starts drawing at the exact second (sending it to the display takes a fraction of a second, depending on the hardware revision). If preparing an image takes longer than the time left, it is shown at the following change time.
 
+Changes follow the local wall clock: across daylight saving changes the multiples are taken from the clock after the change (no waiting out a repeated hour, no change at a skipped one), and if the system clock is adjusted (NTP or manually) the next change is rescheduled to the next aligned time.
+
 ### Auto refresh
 
 `--auto-refresh [SEC]` rescans the images directory every SEC seconds (every hour when given without a value) in a separate thread; the clock and the rotation keep running during the scan.
@@ -128,6 +130,7 @@ The next image is prepared before its change time and the clock is drawn on whol
 - If all images are removed, the default background is shown until images are added again
 - If the images directory or any scanned subdirectory cannot be read (e.g. an unmounted network share or lost permissions), the rescan is discarded and the current images are kept
 - An image replaced at the same path with a different orientation (portrait/landscape) moves to the matching queue
+- An image that cannot be read (e.g. missing permissions) is left out and retried on every rescan; its error is logged once
 - The image prepared for the next change was selected before the rescan, so changes take effect from the change after it
 
 ### Image scaling

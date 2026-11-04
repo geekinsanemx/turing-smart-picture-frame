@@ -6,15 +6,18 @@
 # 1.0.13 - Image changes aligned to the clock: the first image is shown at startup, every following change
 #          happens at a multiple of --interval seconds counted from local midnight (interval 30 -> :00 and
 #          :30, 3600 -> X:00:00), realigned at 00:00:00 every day; multiples follow the local wall clock
-#          across daylight saving changes. The next image is prepared before its
-#          change time, and the main loop draws on whole seconds, so the change starts on time.
+#          across daylight saving changes and are rescheduled after wall clock adjustments. The next image
+#          is prepared and loaded in memory before its change time (the main loop no longer reads the
+#          cache, so eviction cannot skip a change), and the main loop draws on whole seconds, so the
+#          change starts on time.
 #          --auto-refresh [SEC] (default 3600 when given without a value) rescans the source directory in
 #          its own thread: new images join the end of the rotation queue, deleted ones leave it, without
 #          interrupting the clock or the rotation. Orientation of each image is remembered per
 #          (path, mtime, size), so a rescan only opens new or modified files; an image whose orientation
 #          changes at the same path moves to the other queue, and portraits pair again as soon as two
 #          are available. A rescan where any directory cannot be
-#          read is discarded and the current images are kept
+#          read is discarded and the current images are kept. Images that cannot be read are retried on
+#          every rescan. The rescan touches the filesystem only outside the rotation lock
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
 #          command line option with its value, including defaults, plus the cache directory and log file.
 #          The scattered startup lines for the cache, log file, rotation interval, source directory and
@@ -139,7 +142,7 @@ Notes:
   plus the cache directory and log file.
 - The first image is shown at startup; the next ones change at the next multiple of --interval seconds
   from local midnight. An interval that does not divide 24 h is realigned at 00:00:00 every day.
-  Multiples follow the local wall clock, also across daylight saving changes.
+  Multiples follow the local wall clock, also across daylight saving changes and clock adjustments.
 - --auto-refresh adds new images to the end of the rotation queue and removes deleted ones; with
   --preload-images new images enter the next random sample. If the images directory or any scanned
   subdirectory cannot be read during a rescan, the current images are kept.
@@ -154,6 +157,7 @@ import random
 import argparse
 import calendar
 import hashlib
+from collections import namedtuple
 import logging
 from datetime import datetime
 from importlib.resources import files
@@ -177,6 +181,7 @@ REVISIONS = ("A", "B", "C", "D", "SIMU")
 WIDTH, HEIGHT = 320, 480  # Display dimensions in portrait mode
 IMAGE_ROTATION_INTERVAL = 30  # Seconds between background changes, aligned to multiples from local midnight
 SECONDS_PER_DAY = 86400
+CLOCK_TOLERANCE = 1.0         # Seconds a transition may be late before a wall clock jump reschedules it
 AUTO_REFRESH = None           # Seconds between rescans of the images directory, None = disabled
 AUTO_REFRESH_DEFAULT = 3600   # Rescan period of --auto-refresh given without a value
 PRELOAD_IMAGES = 0  # Random sample size of discovered images, 0 = no limit
@@ -253,6 +258,8 @@ def log_warning(message):
 def log_error(message):
     """Log error message (always shown)"""
     logger.error(message)
+
+Background = namedtuple("Background", "path frame")  # Processed cache file path + its RGB image in memory
 
 # Global variables
 stop_event = Event()
@@ -352,6 +359,8 @@ class ImageManager:
         self.shown_images = set()
         self.current_index = 0
         self.orientations = {}
+        self.read_errors = set()
+        self.sample_generation = 0
         self.lock = Lock()
         self.load_images()
 
@@ -399,52 +408,65 @@ class ImageManager:
     def rescan(self):
         """Scan the source directory again and apply added/removed images to the rotation queue.
 
-        Scanning and opening new images happen outside the lock, so the rotation thread is only
-        held for the final list update. New images go to the end of their queue (in the next sample
-        with --preload-images), deleted images leave it. If any scanned directory cannot be read, the scan
-        is discarded and the current images are kept."""
+        All filesystem work (scanning, classifying images, creating the default background) happens
+        outside the lock; the locked section only reconciles the queues with that snapshot. If the
+        rotation thread selected a new sample meanwhile, the snapshot is rebuilt for it. New images go to
+        the end of their queue (in the next sample with --preload-images), deleted images leave it. If any
+        scanned directory cannot be read, the scan is discarded and the current images are kept."""
         try:
             discovered = list(self.find_images(onerror=self.raise_scan_error))
         except OSError as e:
             log_warning(f"Auto refresh: cannot read {self.source_images_dir} ({e}), keeping the current images")
             return
-        with self.lock:
-            pool = self.rotation_pool(discovered)
-        for image_path in pool:
-            self.orientation(image_path)
-
-        with self.lock:
-            previous = set(self.discovered_images)
-            current = set(discovered)
-            self.discovered_images = discovered
-            self.orientations = {key: kind for key, kind in self.orientations.items() if key[0] in current}
-            added, removed = len(current - previous), len(previous - current)
-
-            if not discovered:
-                if previous:
-                    log_warning(f"Auto refresh: no images left in {self.source_images_dir}")
-                    self.image_list = []
-                    self.portrait_images = []
-                    self.create_default_image()
-                return
-
-            pool = self.rotation_pool(discovered)
+        while True:
+            with self.lock:
+                generation = self.sample_generation
+                pool = self.rotation_pool(discovered)
+                had_images = bool(self.discovered_images)
             kinds = {image_path: self.orientation(image_path) for image_path in pool}
-            portraits = {image_path for image_path, kind in kinds.items() if kind == "portrait"}
-            landscapes = {image_path for image_path, kind in kinds.items() if kind == "landscape"}
-            kept_portraits = [p for p in self.portrait_images if p in portraits]
-            kept_landscapes = [p for p in self.landscape_images if p in landscapes or p in portraits]
-            queued = set(kept_portraits + kept_landscapes)
-            self.portrait_images = kept_portraits + [p for p in pool if p in portraits and p not in queued]
-            self.landscape_images = kept_landscapes + [p for p in pool if p in landscapes and p not in queued]
-            self.image_list = pool
-            self.balance_portraits(portraits)
+            default_path = self.default_image_path() if not discovered and had_images else None
+            with self.lock:
+                applied = generation == self.sample_generation
+                if applied:
+                    log, message = self.apply_rescan(discovered, pool, kinds, default_path)
+            if applied:
+                log(message)
+                return
+            log_debug("Auto refresh: a new sample was selected during the rescan, classifying it")
 
-            if added or removed:
-                log_info(f"Auto refresh: {len(discovered)} images discovered (+{added}, -{removed}), "
-                         f"{len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape in rotation")
-            else:
-                log_debug("Auto refresh: no changes")
+    def apply_rescan(self, discovered, pool, kinds, default_path):
+        """Reconcile the queues with a rescan snapshot (caller holds the lock; no filesystem access, not
+        even logging). Returns (log function, message) for the caller to log after releasing the lock."""
+        previous = set(self.discovered_images)
+        current = set(discovered)
+        self.discovered_images = discovered
+        self.orientations = {key: kind for key, kind in self.orientations.items() if key[0] in current}
+        self.read_errors &= current
+        added, removed = len(current - previous), len(previous - current)
+
+        if not discovered:
+            if not default_path:
+                return log_debug, "Auto refresh: still no images"
+            self.image_list = []
+            self.portrait_images = []
+            self.landscape_images = [default_path]
+            return log_warning, f"Auto refresh: no images left in {self.source_images_dir}"
+
+        portraits = {image_path for image_path, kind in kinds.items() if kind == "portrait"}
+        landscapes = {image_path for image_path, kind in kinds.items() if kind == "landscape"}
+        kept_portraits = [p for p in self.portrait_images if p in portraits]
+        kept_landscapes = [p for p in self.landscape_images if p in landscapes or p in portraits]
+        queued = set(kept_portraits + kept_landscapes)
+        self.portrait_images = kept_portraits + [p for p in pool if p in portraits and p not in queued]
+        self.landscape_images = kept_landscapes + [p for p in pool if p in landscapes and p not in queued]
+        self.image_list = pool
+        self.balance_portraits(portraits)
+
+        if added or removed:
+            return log_info, (f"Auto refresh: {len(discovered)} images discovered (+{added}, -{removed}), "
+                              f"{len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape "
+                              "in rotation")
+        return log_debug, "Auto refresh: no changes"
 
     @staticmethod
     def raise_scan_error(error):
@@ -482,6 +504,7 @@ class ImageManager:
         else:
             self.image_list = list(self.discovered_images)
         self.shown_images = set()
+        self.sample_generation += 1
 
         # Categorize images by orientation
         self.categorize_images_by_orientation()
@@ -515,25 +538,31 @@ class ImageManager:
                  + (f", {skipped} skipped (below --min-coverage {MIN_COVERAGE}%)" if skipped else ""))
 
     def orientation(self, image_path):
-        """portrait, landscape, skipped (below --min-coverage) or error; read once per (path, mtime, size)"""
+        """portrait, landscape, skipped (below --min-coverage) or error.
+
+        Successful classifications are remembered per (path, mtime, size); errors are not, so an image
+        that becomes readable again (e.g. restored permissions) is classified on the next call. A read
+        error is logged as an error once per image, repeats as debug."""
         try:
             stat = os.stat(image_path)
-        except OSError as e:
-            log_error(f"Error reading image {image_path}: {e}")
+            key = (image_path, stat.st_mtime_ns, stat.st_size)
+            if key not in self.orientations:
+                self.orientations[key] = self.read_orientation(image_path)
+            kind = self.orientations[key]
+        except Exception as e:
+            if image_path in self.read_errors:
+                log_debug(f"Error reading image {image_path}: {e}")
+            else:
+                self.read_errors.add(image_path)
+                log_error(f"Error reading image {image_path}: {e}")
             return "error"
-        key = (image_path, stat.st_mtime_ns, stat.st_size)
-        if key not in self.orientations:
-            self.orientations[key] = self.read_orientation(image_path)
-        return self.orientations[key]
+        self.read_errors.discard(image_path)
+        return kind
 
     def read_orientation(self, image_path):
-        """Open image_path and classify it for the rotation"""
-        try:
-            with Image.open(image_path) as img:
-                width, height = img.size
-        except Exception as e:
-            log_error(f"Error reading image {image_path}: {e}")
-            return "error"
+        """Open image_path and classify it for the rotation; raises if it cannot be read"""
+        with Image.open(image_path) as img:
+            width, height = img.size
         portrait = height > width
         # Portraits are shown in pairs, each one in half of the screen
         target_width = self.display_width // 2 if portrait else self.display_width
@@ -546,12 +575,15 @@ class ImageManager:
         return "portrait" if portrait else "landscape"
 
     def create_default_image(self):
-        """Create a default gradient background if no images are found"""
+        """Use the default gradient background as the only (landscape) image when no images are found"""
+        self.landscape_images = [self.default_image_path()]
+
+    def default_image_path(self):
+        """Create the default gradient background in the cache if needed and return its path"""
         default_path = self.cache.path_for("default", self.display_width, self.display_height, FONT_PATH)
-        self.landscape_images = [default_path]  # Treat default as landscape
         if self.cache.get(default_path):
             log_info(f"Using cached default background: {default_path}")
-            return
+            return default_path
 
         # Create a gradient background
         img = Image.new('RGB', (self.display_width, self.display_height))
@@ -582,17 +614,31 @@ class ImageManager:
 
         self.cache.put(default_path, img)
         log_info(f"Created default background: {default_path}")
+        return default_path
+
+    def load_cached(self, processed_path):
+        """Background read from the cache file processed_path, or None if it is not cached (or was evicted
+        or damaged since), in which case the caller processes the source image again"""
+        if not self.cache.get(processed_path):
+            return None
+        try:
+            with Image.open(processed_path) as img:
+                return Background(processed_path, img.convert("RGB"))
+        except OSError as e:
+            log_debug(f"Cached image unavailable, processing again: {processed_path}: {e}")
+            return None
 
     def resize_portrait_pair(self, image_path1, image_path2):
-        """Resize two portrait images to fit side by side on screen"""
+        """Resize two portrait images to fit side by side on screen; returns a Background or None"""
         try:
             processed_path = self.cache.path_for("pair", self.display_width, self.display_height,
                                                  SCALE_MODE, MAX_CROP, BLUR_RADIUS, BLUR_BRIGHTNESS,
                                                  self.cache.content_hash(image_path1),
                                                  self.cache.content_hash(image_path2))
-            if self.cache.get(processed_path):
+            cached = self.load_cached(processed_path)
+            if cached:
                 log_info(f"Cached portrait pair: {os.path.basename(image_path1)} + {os.path.basename(image_path2)}")
-                return processed_path
+                return cached
 
             log_debug(f"Processing portrait pair: {os.path.basename(image_path1)} + {os.path.basename(image_path2)}")
 
@@ -616,21 +662,22 @@ class ImageManager:
                 log_info(f"Created portrait pair: {os.path.basename(image_path1)} + {os.path.basename(image_path2)}")
                 log_debug(f"Saved to: {processed_path}")
 
-                return processed_path
+                return Background(processed_path, final_img)
 
         except Exception as e:
             log_error(f"Error processing portrait pair {image_path1}, {image_path2}: {e}")
             return None
 
     def resize_landscape_single(self, image_path):
-        """Scale a single image to the full screen according to SCALE_MODE"""
+        """Scale a single image to the full screen according to SCALE_MODE; returns a Background or None"""
         try:
             processed_path = self.cache.path_for("landscape", self.display_width, self.display_height,
                                                  SCALE_MODE, MAX_CROP, BLUR_RADIUS, BLUR_BRIGHTNESS,
                                                  self.cache.content_hash(image_path))
-            if self.cache.get(processed_path):
+            cached = self.load_cached(processed_path)
+            if cached:
                 log_info(f"Cached landscape ({SCALE_MODE}): {os.path.basename(image_path)}")
-                return processed_path
+                return cached
 
             log_debug(f"Processing landscape image: {os.path.basename(image_path)}")
             with Image.open(image_path) as img:
@@ -645,7 +692,7 @@ class ImageManager:
                 log_info(f"Processed landscape ({SCALE_MODE}): {os.path.basename(image_path)}")
                 log_debug(f"Saved to: {processed_path}")
 
-                return processed_path
+                return Background(processed_path, final_img)
 
         except Exception as e:
             log_error(f"Error processing landscape image {image_path}: {e}")
@@ -892,36 +939,28 @@ def build_overlay():
     log_debug(f"Overlay regions (time, date, day): {[line.region for line in result]}")
     return result
 
-def display_slideshow_content(background_image, force_background_refresh=False):
+def display_slideshow_content(background, force_background_refresh=False):
     """Display slideshow content with time and date.
 
-    The background is loaded from the cache file once per change and kept in memory as the only
-    frame used by the overlay, so cache eviction never affects the image on screen."""
+    background is a Background already loaded in memory by the rotation thread, so the main loop never
+    reads the cache and cache eviction cannot affect a published or displayed image."""
     global last_background, background_frame
 
-    if not background_image:
-        logger.warning(f"Background image not found or invalid: {background_image}")
+    if not background:
+        logger.warning("No background image available")
         return
 
     try:
         # Only refresh background if it changed or forced
-        background_changed = last_background != background_image
+        background_changed = last_background != background.path
         if background_changed or force_background_refresh:
-            last_background = background_image
-            try:
-                with Image.open(background_image) as img:
-                    frame = img.convert("RGB")
-            except OSError as e:
-                logger.warning(f"Background image not found or invalid: {background_image}: {e}")
-                if background_frame is None:
-                    return
-            else:
-                logger.info(f"Displaying background: {os.path.basename(background_image)}")
-                start_bg = time.perf_counter()
-                background_frame = frame
-                lcd_comm.DisplayPILImage(background_frame)
-                end_bg = time.perf_counter()
-                logger.debug(f"Background display took: {end_bg - start_bg:.3f}s")
+            last_background = background.path
+            logger.info(f"Displaying background: {os.path.basename(background.path)}")
+            start_bg = time.perf_counter()
+            background_frame = background.frame
+            lcd_comm.DisplayPILImage(background_frame)
+            end_bg = time.perf_counter()
+            logger.debug(f"Background display took: {end_bg - start_bg:.3f}s")
 
         time_line, date_line, day_line = overlay
         now = datetime.now()
@@ -963,10 +1002,12 @@ def seconds_to_multiple(wall, inclusive):
     return target - elapsed
 
 def offset_change(start, end):
-    """First whole second after start, up to end, where the local UTC offset changes (DST), or None"""
-    low, high = math.ceil(start), math.ceil(end)
-    offset = utc_offset(low)
-    if utc_offset(high) == offset:
+    """First whole second in (start, end] whose local UTC offset differs from the one at start (DST), or None.
+
+    Offset changes happen on whole seconds, so floor(start) shares the offset of start."""
+    offset = utc_offset(start)
+    low, high = math.floor(start), math.floor(end)
+    if high <= low or utc_offset(high) == offset:
         return None
     while high - low > 1:
         middle = (low + high) // 2
@@ -989,20 +1030,33 @@ def next_transition(timestamp):
         return due
     return change + seconds_to_multiple(datetime.fromtimestamp(change), inclusive=True)
 
-def wait_until(timestamp):
-    """Wait until the wall clock reaches timestamp; False if stop_event was set first.
+def wait_for_transition(due):
+    """Wait for the transition scheduled at due; returns the transition instant reached, or None if
+    stop_event was set first.
 
-    Waits at most a minute at a time, so a wall clock adjustment (NTP) moves the deadline with it."""
-    while (remaining := timestamp - time.time()) > 0:
-        if stop_event.wait(min(remaining, 60)):
-            return False
-    return True
+    Wakes at least once a minute to follow wall clock adjustments (NTP, manual changes): if the clock
+    jumped past due by more than CLOCK_TOLERANCE, or back so that an earlier transition comes first,
+    the transition is rescheduled with next_transition instead of happening at a non-aligned time."""
+    while True:
+        now = time.time()
+        if now >= due:
+            if now - due <= CLOCK_TOLERANCE:
+                return due
+            due = next_transition(now)
+            log_info(f"Wall clock changed, next background change at {datetime.fromtimestamp(due):%Y-%m-%d %H:%M:%S}")
+            continue
+        earlier = next_transition(now)
+        if earlier < due - CLOCK_TOLERANCE:
+            due = earlier
+            log_info(f"Wall clock changed, next background change at {datetime.fromtimestamp(due):%Y-%m-%d %H:%M:%S}")
+        if stop_event.wait(min(due - now, 60)):
+            return None
 
 def background_rotation_thread(image_manager):
     """Thread function for rotating background images on the clock schedule of next_transition.
 
-    The next image is prepared first, then shown at its transition time; when preparing it takes
-    longer than that, it is shown at the following one."""
+    The next image is prepared and loaded in memory first, then published at its transition time; when
+    preparing it takes longer than that, it is shown at the following one."""
     global current_background
 
     log_debug("Background rotation thread started")
@@ -1021,13 +1075,14 @@ def background_rotation_thread(image_manager):
 
         due = next_transition(max(due, time.time()))
         log_debug(f"Next background change at {datetime.fromtimestamp(due):%Y-%m-%d %H:%M:%S}")
-        if not wait_until(due):
+        due = wait_for_transition(due)
+        if due is None:
             break
         if new_background:
             current_background = new_background
             wake_event.set()
-            log_info(f"Switched to background: {os.path.basename(new_background)}")
-            log_debug(f"Full path: {new_background}")
+            log_info(f"Switched to background: {os.path.basename(new_background.path)}")
+            log_debug(f"Full path: {new_background.path}")
         else:
             log_warning("Failed to get next background image")
 
