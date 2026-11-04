@@ -23,7 +23,7 @@
 #          every rescan. The rescan touches the filesystem only outside the rotation lock. The fallback
 #          background is retained in memory rather than queued as an evictable cache-file source.
 #          --images must be an existing, readable directory: otherwise the program exits with an argument
-#          error instead of creating it
+#          error instead of creating it (not checked with --font-list, which needs no images)
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
 #          command line option with its value, including defaults, plus the cache directory and log file.
 #          The scattered startup lines for the cache, log file, rotation interval, source directory and
@@ -1231,7 +1231,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Turing Smart Screen Image Slideshow")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug output (default: INFO level only)")
-    parser.add_argument("--images", type=source_directory, default="images", metavar="PATH",
+    parser.add_argument("--images", default="images", metavar="PATH",
                        help="Path to an existing, readable images directory (default: 'images' in current "
                             "location)")
     parser.add_argument("--recursive", action="store_true",
@@ -1285,7 +1285,13 @@ def parse_arguments():
     parser.add_argument("--cache-size", type=int_range(1), default=CACHE_SIZE_MB, metavar="MB",
                        help=f"Max size of the processed images cache in {CACHE_DIR}; least recently used "
                             f"images are deleted first (default: {CACHE_SIZE_MB})")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.font_list:
+        try:
+            args.images = source_directory(args.images)
+        except argparse.ArgumentTypeError as e:
+            parser.error(f"argument --images: {e}")
+    return args
 
 def log_configuration(args):
     """Log every option with its effective value, defaults included"""
