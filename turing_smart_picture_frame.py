@@ -4,8 +4,10 @@
 #
 # Changelog:
 # 1.0.13 - Image changes aligned to the clock: the first image is shown at startup, every following change
-#          happens at a multiple of --interval seconds counted from local midnight (interval 30 -> :00 and
-#          :30, 3600 -> X:00:00), realigned at 00:00:00 every day; multiples follow the local wall clock
+#          happens at a multiple of --interval counted from local midnight (30 -> :00 and :30, 1h -> X:00:00).
+#          --interval accepts seconds or a number with unit s/m/h/d (30, 5m, 1h, 1d) and only values that
+#          keep changes on round clock times: multiples of 5 s that divide an hour (5s ... 30m, 1h) or whole
+#          hours that divide a day (2h, 3h, 4h, 6h, 8h, 12h, 1d); multiples follow the local wall clock
 #          across daylight saving changes and are rescheduled after wall clock adjustments. The next image
 #          is prepared and loaded in memory before its change time (the main loop no longer reads the
 #          cache, so eviction cannot skip a change), and the main loop draws on whole seconds, so the
@@ -88,7 +90,9 @@ Configuration:
    --font NAME|PATH: Font for the time/date overlay: bundled font name (folder name in
                    res/fonts, e.g. pacifico) or path to a custom .ttf/.otf (default: dejavu)
    --font-list   : List the bundled fonts usable as --font NAME and exit
-   --interval SEC: Seconds between image changes, aligned to multiples of SEC from local midnight (default: 30)
+   --interval DURATION: Time between image changes, aligned to its multiples from local midnight: seconds
+                   or a number with unit s/m/h/d (e.g. 30, 5m, 1h, 1d); multiples of 5 s dividing an hour
+                   or whole hours dividing a day (default: 30)
    --auto-refresh [SEC]: Rescan the images directory every SEC seconds (default when given without
                    a value: 3600; not given = no rescan)
    --preload-images N: Use only N random images of the discovered ones, re-sampled after
@@ -140,8 +144,8 @@ Notes:
   screen is written to $XDG_CACHE_HOME/tspf/simu/screencap.png. Nothing is written to the current directory.
 - At startup the effective configuration is logged: every option with its value, defaults included,
   plus the cache directory and log file.
-- The first image is shown at startup; the next ones change at the next multiple of --interval seconds
-  from local midnight. An interval that does not divide 24 h is realigned at 00:00:00 every day.
+- The first image is shown at startup; the next ones change at the next multiple of --interval
+  from local midnight. Every allowed interval divides a day, so each day starts aligned at 00:00:00.
   Multiples follow the local wall clock, also across daylight saving changes and clock adjustments.
 - --auto-refresh adds new images to the end of the rotation queue and removes deleted ones; with
   --preload-images new images enter the next random sample. If the images directory or any scanned
@@ -157,6 +161,7 @@ import random
 import argparse
 import calendar
 import hashlib
+import re
 from collections import namedtuple
 import logging
 from datetime import datetime
@@ -180,7 +185,12 @@ REVISION = "A"     # Display revision (A, B, C, D, or SIMU)
 REVISIONS = ("A", "B", "C", "D", "SIMU")
 WIDTH, HEIGHT = 320, 480  # Display dimensions in portrait mode
 IMAGE_ROTATION_INTERVAL = 30  # Seconds between background changes, aligned to multiples from local midnight
-SECONDS_PER_DAY = 86400
+SECONDS_PER_HOUR, SECONDS_PER_DAY = 3600, 86400
+DURATION_UNITS = {"s": 1, "m": 60, "h": SECONDS_PER_HOUR, "d": SECONDS_PER_DAY}
+MIN_INTERVAL = 5
+# Intervals that keep changes on round clock times: multiples of 5 s dividing an hour, or whole hours dividing a day
+ALLOWED_INTERVALS = (tuple(s for s in range(MIN_INTERVAL, SECONDS_PER_HOUR + 1, 5) if SECONDS_PER_HOUR % s == 0)
+                     + tuple(h * SECONDS_PER_HOUR for h in range(2, 25) if 24 % h == 0))
 CLOCK_TOLERANCE = 1.0         # Seconds a transition may be late before a wall clock jump reschedules it
 AUTO_REFRESH = None           # Seconds between rescans of the images directory, None = disabled
 AUTO_REFRESH_DEFAULT = 3600   # Rescan period of --auto-refresh given without a value
@@ -990,16 +1000,13 @@ def seconds_to_multiple(wall, inclusive):
     """Seconds from the local wall-clock time wall (naive datetime) to the next multiple of
     IMAGE_ROTATION_INTERVAL seconds counted from its midnight; inclusive also accepts wall itself.
 
-    Intervals up to one day are capped at the next midnight."""
+    Every allowed interval divides a day, so the last multiple of a day is the next midnight."""
     elapsed = (wall - wall.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds()
     if inclusive:
         steps = math.ceil(elapsed / IMAGE_ROTATION_INTERVAL)
     else:
         steps = math.floor(elapsed / IMAGE_ROTATION_INTERVAL) + 1
-    target = steps * IMAGE_ROTATION_INTERVAL
-    if IMAGE_ROTATION_INTERVAL <= SECONDS_PER_DAY:
-        target = min(target, SECONDS_PER_DAY)
-    return target - elapsed
+    return steps * IMAGE_ROTATION_INTERVAL - elapsed
 
 def offset_change(start, end):
     """First whole second in (start, end] whose local UTC offset differs from the one at start (DST), or None.
@@ -1021,7 +1028,7 @@ def next_transition(timestamp):
     """First instant after timestamp whose local wall-clock time is a multiple of IMAGE_ROTATION_INTERVAL
     seconds from midnight.
 
-    Intervals up to one day are capped at the next midnight, so every day starts aligned at 00:00:00.
+    Every allowed interval divides a day, so every day starts aligned at 00:00:00.
     When a daylight saving change comes first, the multiple is taken from the wall clock after the
     change: a repeated hour is not waited out and a skipped hour is not scheduled."""
     due = timestamp + seconds_to_multiple(datetime.fromtimestamp(timestamp), inclusive=False)
@@ -1166,6 +1173,32 @@ def int_range(minimum, maximum=None):
         return number
     return parse
 
+def parse_duration(value):
+    """Seconds in a duration: a plain number of seconds, or a number followed by s, m, h or d
+    (case-insensitive), e.g. 30, 30s, 5m, 1h, 1d. Raises ValueError otherwise."""
+    match = re.fullmatch(r"(\d+)([smhd]?)", value.strip().lower())
+    if not match:
+        raise ValueError(f"'{value}' is not a duration (e.g. 30, 30s, 5m, 1h, 1d)")
+    return int(match[1]) * DURATION_UNITS[match[2] or "s"]
+
+def format_duration(seconds):
+    """Shortest exact form of seconds in the largest whole unit: 86400 -> 1d, 7200 -> 2h, 300 -> 5m, 75 -> 75s"""
+    for unit, size in sorted(DURATION_UNITS.items(), key=lambda item: -item[1]):
+        if seconds % size == 0:
+            return f"{seconds // size}{unit}"
+
+def rotation_interval(value):
+    """argparse type: --interval as a duration (see parse_duration) that is one of ALLOWED_INTERVALS"""
+    try:
+        seconds = parse_duration(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+    if seconds not in ALLOWED_INTERVALS:
+        raise argparse.ArgumentTypeError(
+            f"'{value}' ({seconds} s) does not keep changes on round clock times; allowed: "
+            + ", ".join(format_duration(allowed) for allowed in ALLOWED_INTERVALS))
+    return seconds
+
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Turing Smart Screen Image Slideshow")
@@ -1180,9 +1213,12 @@ def parse_arguments():
                             f"to a custom .ttf/.otf file (default: {DEFAULT_FONT})")
     parser.add_argument("--font-list", action="store_true",
                        help="List the bundled fonts usable as --font NAME and exit")
-    parser.add_argument("--interval", type=int_range(1), default=IMAGE_ROTATION_INTERVAL, metavar="SEC",
-                       help="Seconds between image changes; changes happen at multiples of SEC counted from "
-                            f"local midnight, e.g. 30 = at :00 and :30 (default: {IMAGE_ROTATION_INTERVAL})")
+    parser.add_argument("--interval", type=rotation_interval, default=IMAGE_ROTATION_INTERVAL, metavar="DURATION",
+                       help="Time between image changes: seconds, or a number with unit s/m/h/d (e.g. 30, 5m, "
+                            "1h, 1d). Changes happen at multiples of it counted from local midnight, e.g. 30 = "
+                            "at :00 and :30. Allowed: multiples of 5 s that divide an hour (5s ... 30m, 1h) or "
+                            f"whole hours that divide a day (2h, 3h, 4h, 6h, 8h, 12h, 1d) "
+                            f"(default: {IMAGE_ROTATION_INTERVAL})")
     parser.add_argument("--auto-refresh", type=int_range(1), nargs="?", const=AUTO_REFRESH_DEFAULT,
                        default=AUTO_REFRESH, metavar="SEC",
                        help="Rescan the images directory every SEC seconds for new or deleted images, without "
@@ -1268,9 +1304,6 @@ def main():
 
     configure_logging(VERBOSE_LEVEL)
     log_configuration(args)
-    if SECONDS_PER_DAY % IMAGE_ROTATION_INTERVAL:
-        log_warning(f"--interval {IMAGE_ROTATION_INTERVAL} does not divide 24 h: image changes are realigned "
-                    "at 00:00:00 every day")
 
     # Set up signal handlers
     signal.signal(signal.SIGINT, sighandler)
