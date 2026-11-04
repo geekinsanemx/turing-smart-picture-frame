@@ -20,7 +20,10 @@
 #          changes at the same path moves to the other queue, and portraits pair again as soon as two
 #          are available. A rescan where any directory cannot be
 #          read is discarded and the current images are kept. Images that cannot be read are retried on
-#          every rescan. The rescan touches the filesystem only outside the rotation lock
+#          every rescan. The rescan touches the filesystem only outside the rotation lock. The fallback
+#          background is retained in memory rather than queued as an evictable cache-file source.
+#          --images must be an existing, readable directory: otherwise the program exits with an argument
+#          error instead of creating it
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
 #          command line option with its value, including defaults, plus the cache directory and log file.
 #          The scattered startup lines for the cache, log file, rotation interval, source directory and
@@ -86,7 +89,8 @@ Features:
 Configuration:
 1. Command Line Arguments:
    --debug       : Enable debug output (more verbose logging)
-   --images PATH : Specify directory containing images (default: './images')
+   --images PATH : Existing, readable directory containing images; the program exits with an error
+                   otherwise (default: './images')
    --recursive   : Search for images recursively in subdirectories
    --font NAME|PATH: Font for the time/date overlay: bundled font name (folder name in
                    res/fonts, e.g. pacifico) or path to a custom .ttf/.otf (default: dejavu)
@@ -369,6 +373,7 @@ class ImageManager:
         self.landscape_images = []
         self.shown_images = set()
         self.current_index = 0
+        self.default_background = None
         self.orientations = {}
         self.read_errors = set()
         self.sample_generation = 0
@@ -377,12 +382,6 @@ class ImageManager:
 
     def load_images(self):
         """Scan directory for supported image files and categorize by orientation"""
-        if not os.path.exists(self.source_images_dir):
-            os.makedirs(self.source_images_dir)
-            log_warning(f"Created source images directory: {self.source_images_dir}")
-            log_info("Please add some images (PNG, JPG, JPEG, BMP, GIF) to the source images directory")
-            return
-
         log_info(f"Scanning for images in: {os.path.abspath(self.source_images_dir)}")
         log_info(f"Recursive search: {'enabled' if self.recursive_search else 'disabled'}")
 
@@ -433,19 +432,19 @@ class ImageManager:
             with self.lock:
                 generation = self.sample_generation
                 pool = self.rotation_pool(discovered)
-                had_images = bool(self.discovered_images)
+                needs_default = not discovered and self.default_background is None
             kinds = {image_path: self.orientation(image_path) for image_path in pool}
-            default_path = self.default_image_path() if not discovered and had_images else None
+            default_background = self.prepare_default_background() if needs_default else None
             with self.lock:
                 applied = generation == self.sample_generation
                 if applied:
-                    log, message = self.apply_rescan(discovered, pool, kinds, default_path)
+                    log, message = self.apply_rescan(discovered, pool, kinds, default_background)
             if applied:
                 log(message)
                 return
             log_debug("Auto refresh: a new sample was selected during the rescan, classifying it")
 
-    def apply_rescan(self, discovered, pool, kinds, default_path):
+    def apply_rescan(self, discovered, pool, kinds, default_background):
         """Reconcile the queues with a rescan snapshot (caller holds the lock; no filesystem access, not
         even logging). Returns (log function, message) for the caller to log after releasing the lock."""
         previous = set(self.discovered_images)
@@ -456,13 +455,16 @@ class ImageManager:
         added, removed = len(current - previous), len(previous - current)
 
         if not discovered:
-            if not default_path:
-                return log_debug, "Auto refresh: still no images"
+            if default_background is not None:
+                self.default_background = default_background
             self.image_list = []
             self.portrait_images = []
-            self.landscape_images = [default_path]
+            self.landscape_images = []
+            if not previous:
+                return log_debug, "Auto refresh: still no images"
             return log_warning, f"Auto refresh: no images left in {self.source_images_dir}"
 
+        self.default_background = None
         portraits = {image_path for image_path, kind in kinds.items() if kind == "portrait"}
         landscapes = {image_path for image_path, kind in kinds.items() if kind == "landscape"}
         kept_portraits = [p for p in self.portrait_images if p in portraits]
@@ -586,15 +588,16 @@ class ImageManager:
         return "portrait" if portrait else "landscape"
 
     def create_default_image(self):
-        """Use the default gradient background as the only (landscape) image when no images are found"""
-        self.landscape_images = [self.default_image_path()]
+        """Keep the default gradient background in memory when no source images are found."""
+        self.default_background = self.prepare_default_background()
 
-    def default_image_path(self):
-        """Create the default gradient background in the cache if needed and return its path"""
+    def prepare_default_background(self):
+        """Return a loaded fallback independent of disk-cache eviction."""
         default_path = self.cache.path_for("default", self.display_width, self.display_height, FONT_PATH)
-        if self.cache.get(default_path):
+        cached = self.load_cached(default_path)
+        if cached:
             log_info(f"Using cached default background: {default_path}")
-            return default_path
+            return cached
 
         # Create a gradient background
         img = Image.new('RGB', (self.display_width, self.display_height))
@@ -625,7 +628,7 @@ class ImageManager:
 
         self.cache.put(default_path, img)
         log_info(f"Created default background: {default_path}")
-        return default_path
+        return Background(default_path, img)
 
     def load_cached(self, processed_path):
         """Background read from the cache file processed_path, or None if it is not cached (or was evicted
@@ -765,6 +768,8 @@ class ImageManager:
         The queues are only locked while choosing the source images; processing runs unlocked, so a
         concurrent rescan never waits for it."""
         with self.lock:
+            if self.default_background is not None:
+                return self.default_background
             selection = self.select_next()
         if not selection:
             return None
@@ -1174,6 +1179,15 @@ def int_range(minimum, maximum=None):
         return number
     return parse
 
+def source_directory(value):
+    """argparse type: path ('~' expanded) of an existing, readable directory; it is never created"""
+    path = os.path.expanduser(value)
+    if not os.path.isdir(path):
+        raise argparse.ArgumentTypeError(f"'{value}' does not exist or is not a directory")
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise argparse.ArgumentTypeError(f"'{value}' is not readable")
+    return path
+
 def parse_duration(value):
     """Seconds in a duration: a plain number of seconds, or a number followed by s, m, h or d
     (case-insensitive), e.g. 30, 30s, 5m, 1h, 1d. Raises ValueError otherwise."""
@@ -1217,8 +1231,9 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Turing Smart Screen Image Slideshow")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug output (default: INFO level only)")
-    parser.add_argument("--images", type=str, default="images",
-                       help="Path to images directory (default: 'images' in current location)")
+    parser.add_argument("--images", type=source_directory, default="images", metavar="PATH",
+                       help="Path to an existing, readable images directory (default: 'images' in current "
+                            "location)")
     parser.add_argument("--recursive", action="store_true",
                        help="Search for images recursively in subdirectories")
     parser.add_argument("--font", type=font_file, default=DEFAULT_FONT, metavar="NAME|PATH",

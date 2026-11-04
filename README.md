@@ -67,7 +67,7 @@ turing-smart-picture-frame [--images PATH] [--recursive] [--preload-images N] [-
 
 | Option | Description |
 |---|---|
-| `--images PATH` | Images directory (default: `images` in the current directory) |
+| `--images PATH` | Images directory; it must exist and be readable, otherwise the program exits with an error (default: `images` in the current directory) |
 | `--recursive` | Search images in subdirectories |
 | `--preload-images N` | Use only N random images of the discovered ones; a new random sample is taken once all of them have been shown. Only the sampled images are opened, so startup stays fast with thousands of images (default: `0` = no limit) |
 | `--interval DURATION` | Time between image changes, at its multiples counted from local midnight: seconds or a number with unit `s`/`m`/`h`/`d` (`30`, `5m`, `1h`, `1d`); only round clock intervals from 5 s to 1 day are accepted (default: `30`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
