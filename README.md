@@ -126,7 +126,8 @@ The next image is prepared before its change time and the clock is drawn on whol
 - With `--preload-images`, deleted images leave the current sample and new images can enter the next sample
 - Only new or modified files are opened; the orientation of known images is remembered
 - If all images are removed, the default background is shown until images are added again
-- If the images directory is not accessible (e.g. an unmounted network share), the current images are kept
+- If the images directory or any scanned subdirectory cannot be read (e.g. an unmounted network share or lost permissions), the rescan is discarded and the current images are kept
+- An image replaced at the same path with a different orientation (portrait/landscape) moves to the matching queue
 - The image prepared for the next change was selected before the rescan, so changes take effect from the change after it
 
 ### Image scaling

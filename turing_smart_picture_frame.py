@@ -10,7 +10,9 @@
 #          --auto-refresh [SEC] (default 3600 when given without a value) rescans the source directory in
 #          its own thread: new images join the end of the rotation queue, deleted ones leave it, without
 #          interrupting the clock or the rotation. Orientation of each image is remembered per
-#          (path, mtime, size), so a rescan only opens new or modified files
+#          (path, mtime, size), so a rescan only opens new or modified files; an image whose orientation
+#          changes at the same path moves to the other queue. A rescan where any directory cannot be
+#          read is discarded and the current images are kept
 # 1.0.12 - The effective configuration is logged at startup, before the display is initialized: every
 #          command line option with its value, including defaults, plus the cache directory and log file.
 #          The scattered startup lines for the cache, log file, rotation interval, source directory and
@@ -136,8 +138,8 @@ Notes:
 - The first image is shown at startup; the next ones change at the next multiple of --interval seconds
   from local midnight. An interval that does not divide 24 h is realigned at 00:00:00 every day.
 - --auto-refresh adds new images to the end of the rotation queue and removes deleted ones; with
-  --preload-images new images enter the next random sample. If the images directory is not accessible
-  during a rescan, the current images are kept.
+  --preload-images new images enter the next random sample. If the images directory or any scanned
+  subdirectory cannot be read during a rescan, the current images are kept.
 """
 
 import os
@@ -381,9 +383,11 @@ class ImageManager:
 
             self.select_sample()
 
-    def find_images(self):
-        """Yield supported image files (extension matched case-insensitively), skipping hidden files/dirs"""
-        for root, dirs, filenames in os.walk(self.source_images_dir):
+    def find_images(self, onerror=None):
+        """Yield supported image files (extension matched case-insensitively), skipping hidden files/dirs.
+
+        onerror is passed to os.walk: by default unreadable directories are skipped silently."""
+        for root, dirs, filenames in os.walk(self.source_images_dir, onerror=onerror):
             dirs[:] = sorted(d for d in dirs if not d.startswith('.')) if self.recursive_search else []
             for name in sorted(filenames):
                 if not name.startswith('.') and os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
@@ -394,11 +398,13 @@ class ImageManager:
 
         Scanning and opening new images happen outside the lock, so the rotation thread is only
         held for the final list update. New images go to the end of their queue (in the next sample
-        with --preload-images), deleted images leave it. An inaccessible directory keeps the current images."""
-        if not os.path.isdir(self.source_images_dir):
-            log_warning(f"Auto refresh: {self.source_images_dir} is not accessible, keeping the current images")
+        with --preload-images), deleted images leave it. If any scanned directory cannot be read, the scan
+        is discarded and the current images are kept."""
+        try:
+            discovered = list(self.find_images(onerror=self.raise_scan_error))
+        except OSError as e:
+            log_warning(f"Auto refresh: cannot read {self.source_images_dir} ({e}), keeping the current images")
             return
-        discovered = list(self.find_images())
         with self.lock:
             pool = self.rotation_pool(discovered)
         for image_path in pool:
@@ -423,11 +429,11 @@ class ImageManager:
             kinds = {image_path: self.orientation(image_path) for image_path in pool}
             portraits = {image_path for image_path, kind in kinds.items() if kind == "portrait"}
             landscapes = {image_path for image_path, kind in kinds.items() if kind == "landscape"}
-            queued = set(self.portrait_images + self.landscape_images)
-            self.portrait_images = ([p for p in self.portrait_images if p in portraits]
-                                    + [p for p in pool if p in portraits and p not in queued])
-            self.landscape_images = ([p for p in self.landscape_images if p in landscapes or p in portraits]
-                                     + [p for p in pool if p in landscapes and p not in queued])
+            kept_portraits = [p for p in self.portrait_images if p in portraits]
+            kept_landscapes = [p for p in self.landscape_images if p in landscapes or p in portraits]
+            queued = set(kept_portraits + kept_landscapes)
+            self.portrait_images = kept_portraits + [p for p in pool if p in portraits and p not in queued]
+            self.landscape_images = kept_landscapes + [p for p in pool if p in landscapes and p not in queued]
             self.image_list = pool
             self.balance_portraits(portraits)
 
@@ -436,6 +442,11 @@ class ImageManager:
                          f"{len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape in rotation")
             else:
                 log_debug("Auto refresh: no changes")
+
+    @staticmethod
+    def raise_scan_error(error):
+        """os.walk onerror handler for rescans: a partial scan must not be mistaken for deleted images"""
+        raise error
 
     def rotation_pool(self, discovered):
         """Images eligible for the rotation: all discovered, or the current sample still present"""
