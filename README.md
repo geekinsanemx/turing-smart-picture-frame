@@ -71,7 +71,7 @@ turing-smart-picture-frame [--images PATH] [--recursive] [--preload-images N] [-
 | `--recursive` | Search images in subdirectories |
 | `--preload-images N` | Use only N random images of the discovered ones; a new random sample is taken once all of them have been shown. Only the sampled images are opened, so startup stays fast with thousands of images (default: `0` = no limit) |
 | `--interval DURATION` | Time between image changes, at its multiples counted from local midnight: seconds or a number with unit `s`/`m`/`h`/`d` (`30`, `5m`, `1h`, `1d`); only round clock intervals from 5 s to 1 day are accepted (default: `30`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
-| `--auto-refresh [DURATION]` | Rescan the images directory for new or deleted images every DURATION, without interrupting the slideshow: seconds or a number with unit `s`/`m`/`h`/`d` (`600`, `30m`, `2h`, `1d`); without a value every `1h` (default: no rescan, see [Auto refresh](#auto-refresh)) |
+| `--auto-refresh [DURATION]` | Rescan the images directory for new or deleted images every DURATION, without interrupting the slideshow: seconds or a number with unit `s`/`m`/`h`/`d` (`600`, `30m`, `2h`, `1d`), up to `365d`; without a value every `1h` (default: no rescan, see [Auto refresh](#auto-refresh)) |
 | `--font NAME\|PATH` | Font for the time/date overlay: a bundled font name (see [Fonts](#fonts), case-insensitive) or the path to a custom `.ttf`/`.otf` file (default: `dejavu`) |
 | `--font-list` | List the bundled fonts usable as `--font NAME` and exit |
 | `--time-size N` / `--date-size N` / `--day-size N` | Overlay font sizes (default: `34` / `22` / `24`) |
@@ -125,23 +125,23 @@ Started at 10:15:20 with `--interval 30`, the first change is at 10:15:30, then 
 | Minutes (multiples of 5 s dividing an hour) | `1m`, `75s`, `80s`, `90s`, `100s`, `2m`, `150s`, `3m`, `200s`, `225s`, `4m`, `5m`, `6m`, `400s`, `450s`, `10m`, `12m`, `15m`, `20m`, `30m` |
 | Hours (dividing a day) | `1h`, `2h`, `3h`, `4h`, `6h`, `8h`, `12h`, `1d` (= `24h`) |
 
-Any other value is rejected at startup with the list of allowed values. Every allowed interval divides a day, so each day starts aligned at 00:00:00, which also refreshes the date overlay at midnight.
+Any other value is rejected at startup with the list of allowed values. Every allowed interval divides a day, so each day starts aligned at 00:00:00, and the date and day are redrawn when the date changes, even if the image stays the same.
 
 The next image is prepared before its change time and the clock is drawn on whole seconds, so the new image starts drawing at the exact second (sending it to the display takes a fraction of a second, depending on the hardware revision). If preparing an image takes longer than the time left, it is shown at the following change time.
 
-Changes follow the local wall clock: across daylight saving changes the multiples are taken from the clock after the change (no waiting out a repeated hour, no change at a skipped one), and if the system clock is adjusted (NTP or manually) the next change is rescheduled to the next aligned time.
+Changes follow the local wall clock: across daylight saving changes the multiples are taken from the clock after the change (no waiting out a repeated hour, no change at a skipped one), and small forward clock corrections publish a prepared image immediately rather than losing a full interval. Larger forward jumps reschedule the next change; late wake-ups are detected using elapsed time.
 
 ### Auto refresh
 
-`--auto-refresh [DURATION]` rescans the images directory every DURATION (every hour when given without a value) in a separate thread; the clock and the rotation keep running during the scan. DURATION uses the same syntax as `--interval` (`600`, `30m`, `2h`, `1d`), but any value from 1 second is accepted, since rescans are not aligned to the clock.
+`--auto-refresh [DURATION]` rescans the images directory every DURATION (every hour when given without a value) in a separate thread; the clock and the rotation keep running during the scan. DURATION uses the same syntax as `--interval` (`600`, `30m`, `2h`, `1d`), with values from 1 second to 365 days accepted; rescans are not aligned to the clock.
 
 - New images are added to the end of the rotation queue; deleted images are removed from it
 - With `--preload-images`, deleted images leave the current sample and new images can enter the next sample
 - Only new or modified files are opened; the orientation of known images is remembered
-- If all images are removed, the default background is shown until images are added again
-- If the images directory or any scanned subdirectory cannot be read (e.g. an unmounted network share or lost permissions), the rescan is discarded and the current images are kept
+- If no images can be displayed (empty source, unsupported coverage or unreadable files), the default background is shown until usable images become available
+- If the images directory cannot be read, or its device/inode identity changes (for example after unmounting a share), the rescan is discarded and the current images are kept; unreadable subdirectories (e.g. `lost+found` at a mount point) are skipped and the images already known under them are kept
 - An image replaced at the same path with a different orientation (portrait/landscape) moves to the matching queue
-- An image that cannot be read (e.g. missing permissions) is left out and retried on every rescan; its error is logged once
+- Unreadable images are excluded and retried during refresh. A file that fails full decoding is excluded for its current metadata version and retried after it changes, avoiding repeated decode failures for unchanged truncated files.
 - The image prepared for the next change was selected before the rescan, so changes take effect from the change after it
 
 ### Image scaling

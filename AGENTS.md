@@ -15,11 +15,15 @@ give a concrete failure scenario (input or state -> wrong behavior). Do not repo
 formatting preferences.
 
 ### Correctness and concurrency (P1)
-- Shared state between threads (ImageManager queues, current_background, events) must be read and
-  written under the existing lock or through the existing events; flag races, lost updates and
+- ImageManager rotation state (discovered images, sample, queues, default background) has a single
+  owner: the main thread until the rotation thread starts, then only the rotation thread. Other
+  threads must not modify it; data crosses threads only through offer_scan()/pending_scan (single
+  slot under pending_lock, refresh -> rotation), the image_list tuple (replaced, never modified;
+  read by scan()), pending_transition under transition_lock (rotation -> main loop), current_background (main loop only) and wake_event, stop_event and the
+  thread-safe OrientationCache. Flag any other cross-thread access, races, lost updates and
   check-then-act sequences across threads.
 - Slow work (image decoding, resizing, directory scans, file I/O) must not run while holding a lock
-  that the rotation or main loop needs.
+  (OrientationCache's lock and pending_lock guard only their own data).
 - Only the main loop may call display (lcd_comm) methods.
 - Shutdown: every loop must exit promptly when stop_event is set; flag blocking calls without timeout.
 - Timing: transitions must stay aligned to multiples of --interval from local midnight; flag drift,
