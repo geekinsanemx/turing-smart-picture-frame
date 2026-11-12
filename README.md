@@ -10,7 +10,7 @@ The display communication code in `library/` comes from [turing-smart-screen-pyt
 - Random rotation every `--interval` (default 60 seconds; `5m`, `1h`, ... also accepted), aligned to the clock (see [Clock-aligned rotation](#clock-aligned-rotation))
 - Images from one or more directories (`--images`, repeatable)
 - Optional periodic rescan of the images directories (`--auto-refresh`)
-- Optional preloading of image batches into the cache, shown without reading the source files (`--preload-images`)
+- Optional preloading of image batches, shown without reading the source files (`--preload-images`)
 - Time (refreshed every second), date and day of week overlay in the bottom right corner
 - Optional recursive search of the images directories
 - Gradient default background when no images are found
@@ -71,7 +71,7 @@ turing-smart-picture-frame [--images PATH [--images PATH ...]] [--recursive] [--
 |---|---|
 | `--images PATH` | Images directory; it must exist and be readable, otherwise the program exits with an error. Repeat it to show the images of several directories: `--images DIR1 --images DIR2`. A directory given twice (also through a symlink or a bind mount) is used once; with `--recursive`, a directory inside another `--images` directory (compared by real path, not inside a hidden directory) is ignored, since the recursive search already reads it; the same file under different paths (symlink, hardlink) is shown once per path (default: `images` in the current directory) |
 | `--recursive` | Search images in subdirectories |
-| `--preload-images [N]` | Process batches of N random images (of all `--images` directories together) in advance into the cache and show them from there, without reading the source files; without a value `100`. Not given or `0`: each image is processed when its turn comes (default: `0`, see [Preloading](#preloading)) |
+| `--preload-images [N]` | Process batches of N random images (of all `--images` directories together) in advance into `$XDG_CACHE_HOME/tspf/preload/` and show them from there, without reading the source files; without a value `100`. Not given or `0`: each image is processed when its turn comes (default: `0`, see [Preloading](#preloading)) |
 | `--interval DURATION` | Time between image changes, at its multiples counted from local midnight: seconds or a number with unit `s`/`m`/`h`/`d` (`30`, `5m`, `1h`, `1d`); only round clock intervals from 5 s to 1 day are accepted (default: `60`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
 | `--auto-refresh [DURATION]` | Rescan the images directories for new or deleted images every DURATION, without interrupting the slideshow: seconds or a number with unit `s`/`m`/`h`/`d` (`600`, `30m`, `2h`, `1d`), up to `365d`; without a value every `1h` (default: no rescan, see [Auto refresh](#auto-refresh)) |
 | `--font NAME\|PATH` | Font for the time/date overlay: a bundled font name (see [Fonts](#fonts), case-insensitive) or the path to a custom `.ttf`/`.otf` file (default: `dejavu`) |
@@ -168,13 +168,12 @@ Portrait images are shown in pairs, each one in half of the screen with the same
 
 Without `--preload-images` (or with `0`) each image is processed when its turn comes, so its file must be readable at that moment; an image that cannot be opened is skipped and the next one is tried.
 
-With `--preload-images N` (`100` when given without a value) a separate thread processes a batch of N random images in advance into the cache, portraits already paired, and the slideshow shows the batch from the cache without reading the source files. This suits images on a network share: a share that goes away does not interrupt the batch being shown.
+With `--preload-images N` (`100` when given without a value) a batch of N random images is processed in advance, portraits already paired, and saved fitted to the screen in `$XDG_CACHE_HOME/tspf/preload/`; the slideshow shows the batch from there without reading the source files. This suits images on a network share: a share that goes away does not interrupt the batch being shown.
 
-- The next batch is prepared while the current one is shown, and replaces it once the current one has been shown entirely
-- If the next batch is not ready yet, or none of its images can be read (e.g. the share is not available), the current batch is shown again and a new batch is tried; a batch with fewer usable images is topped up with backgrounds of the current one
-- Until the first batch is ready (at startup), one image is processed on demand
-- The batches in use are never deleted by the `--cache-size` limit; each processed background takes roughly 0.1-0.5 MB, and a warning is logged when two batches do not fit in `--cache-size`
-- Preparing a batch reads and processes N images at once, which takes a while on slow hardware; it runs in the background and does not delay the image changes
+- Once the whole batch has been shown, a new batch is preloaded and the old one is deleted
+- If none of the new batch's images can be read (e.g. the share is not available), the current batch is shown again and a new batch is tried after it
+- The preloaded batch is not counted in `--cache-size`; each processed background takes roughly 0.1-0.5 MB
+- The batch is prepared right after an image change, before the next one; processed images are also kept in the cache, so images already shown before are preloaded faster. If preparing takes longer than `--interval` (many new images on slow hardware), that change is shown at the following change time
 
 ### Image cache
 
@@ -184,9 +183,9 @@ Each image is resized/cropped for the screen the first time it is shown and stor
 - identical images in different directories (or with different names) share one cache file
 - an edited image gets a new hash and is processed again
 
-When the cache exceeds `--cache-size` MB, the least recently used files are deleted, except the preloaded batches in use (see [Preloading](#preloading)). The cache can also be removed manually at any time.
+When the cache exceeds `--cache-size` MB, the least recently used files are deleted (the preloaded batch is kept apart, see [Preloading](#preloading)). The cache can also be removed manually at any time.
 
-Nothing is written to the current directory or to the images directories. Other runtime files are also kept in `$XDG_CACHE_HOME/tspf/` (default `~/.cache/tspf/`): `log.log` (max 1 MB), and with `--revision SIMU` the `simu/` subdirectory (`screencap.png`, `tmp`). The cache size limit only counts processed images, so these files are never deleted by it.
+Nothing is written to the current directory or to the images directories. Other runtime files are also kept in `$XDG_CACHE_HOME/tspf/` (default `~/.cache/tspf/`): `log.log` (max 1 MB), with `--preload-images` the `preload/` subdirectory (the current batch), and with `--revision SIMU` the `simu/` subdirectory (`screencap.png`, `tmp`). The cache size limit only counts processed images, so these files are never deleted by it.
 
 ## Fonts
 
