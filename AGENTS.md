@@ -6,7 +6,8 @@ Python 3.9+ picture frame for Turing Smart Screen USB displays. The application 
 module `turing_smart_picture_frame.py` (launcher: `turing-smart-picture-frame.py`). `library/`
 holds display communication code from the upstream turing-smart-screen-python project; `res/fonts/`
 holds bundled fonts. Runtime threads: the main loop (the only thread that talks to the display),
-the background rotation thread and, with `--auto-refresh`, the source refresh thread.
+the background rotation thread, with `--auto-refresh` the source refresh thread and, with
+`--preload-images`, the preload thread.
 
 ## Code Review Rules
 
@@ -15,15 +16,18 @@ give a concrete failure scenario (input or state -> wrong behavior). Do not repo
 formatting preferences.
 
 ### Correctness and concurrency (P1)
-- ImageManager rotation state (discovered images, sample, queues, default background) has a single
-  owner: the main thread until the rotation thread starts, then only the rotation thread. Other
-  threads must not modify it; data crosses threads only through offer_scan()/pending_scan (single
-  slot under pending_lock, refresh -> rotation), the image_list tuple (replaced, never modified;
-  read by scan()), pending_transition under transition_lock (rotation -> main loop), current_background (main loop only) and wake_event, stop_event and the
-  thread-safe OrientationCache. Flag any other cross-thread access, races, lost updates and
+- ImageManager rotation state (discovered images, queues, preloaded batch, default background) has a
+  single owner: the main thread until the rotation thread starts, then only the rotation thread.
+  Other threads must not modify it; data crosses threads only through offer_scan()/pending_scan
+  (single slot under pending_lock, refresh -> rotation), request_batch()/take_request() and
+  offer_batch()/take_batch() (preload_request and preload_result slots under preload_lock, rotation
+  <-> preload; the request is an immutable tuple of candidates), pending_transition under
+  transition_lock (rotation -> main loop), current_background (main loop only) and wake_event,
+  preload_event, stop_event, the thread-safe OrientationCache and ImageCache (its lock guards
+  content_hashes and pinned). Flag any other cross-thread access, races, lost updates and
   check-then-act sequences across threads.
 - Slow work (image decoding, resizing, directory scans, file I/O) must not run while holding a lock
-  (OrientationCache's lock and pending_lock guard only their own data).
+  (OrientationCache's and ImageCache's locks, pending_lock and preload_lock guard only their own data).
 - Only the main loop may call display (lcd_comm) methods.
 - Shutdown: every loop must exit promptly when stop_event is set; flag blocking calls without timeout.
 - Timing: transitions must stay aligned to multiples of --interval from local midnight; flag drift,
