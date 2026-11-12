@@ -9,7 +9,9 @@
 #          slideshow shows the batch from there without reading the source files, so a share that goes
 #          away does not interrupt it. Once the batch has been shown, a new batch is preloaded and the
 #          old one deleted; if none of the new batch's images can be read (e.g. the share is not
-#          available), the current batch is shown again. --preload-images without a value means 100
+#          available), the current batch is shown again. A portrait whose pair partner cannot be read is
+#          shown alone; a symlink at PRELOAD_DIR is replaced by a directory, so nothing is written or
+#          deleted outside the cache. --preload-images without a value means 100
 #          (PRELOAD_IMAGES_DEFAULT); not given or 0 processes each image when its turn comes, as before.
 #          The previous random sampling (only N images classified, re-sampled after all were shown) is
 #          replaced by the batches
@@ -417,6 +419,14 @@ class ImageCache:
         if removed:
             log_debug(f"Cache limit: removed {removed} least recently used images, {total / 1048576:.1f} MB left")
 
+def preload_directory():
+    """Make PRELOAD_DIR a real directory inside the cache: a symlink there is removed (not what it points
+    to), so preloaded batches are never written or deleted outside the cache"""
+    if os.path.islink(PRELOAD_DIR):
+        log_warning(f"{PRELOAD_DIR} is a symlink; removing the link and using a directory instead")
+        os.remove(PRELOAD_DIR)
+    os.makedirs(PRELOAD_DIR, exist_ok=True)
+
 def owner(path, directories):
     """The most specific of directories that contains path, or None"""
     return max((directory for directory in directories if path.startswith(os.path.join(directory, ""))),
@@ -552,8 +562,9 @@ class ImageManager:
         self.pending_lock = Lock()
         self.pending_scan = None
         if preload_images:
-            shutil.rmtree(PRELOAD_DIR, ignore_errors=True)
-            os.makedirs(PRELOAD_DIR, exist_ok=True)
+            if not os.path.islink(PRELOAD_DIR):
+                shutil.rmtree(PRELOAD_DIR, ignore_errors=True)
+            preload_directory()
         self.load_images()
 
     @staticmethod
@@ -806,7 +817,7 @@ class ImageManager:
             selections.append((portraits[-1],))
         random.shuffle(selections)
         try:
-            os.makedirs(PRELOAD_DIR, exist_ok=True)
+            preload_directory()
             directory = tempfile.mkdtemp(dir=PRELOAD_DIR)
         except OSError as e:
             log_error(f"Cannot create the preloaded batch in {PRELOAD_DIR} ({e})")
@@ -816,18 +827,20 @@ class ImageManager:
             if stop_event.is_set():
                 break
             if len(selection) == 2:
-                background = self.resize_portrait_pair(*selection)
+                backgrounds = [self.resize_portrait_pair(*selection)]
+                if backgrounds[0] is None:
+                    backgrounds = [self.resize_landscape_single(image_path) for image_path in selection]
             else:
-                background = self.resize_landscape_single(selection[0])
-            if background is None:
-                continue
-            path = os.path.join(directory, f"{len(batch):04d}.png")
+                backgrounds = [self.resize_landscape_single(selection[0])]
             try:
-                background.frame.save(path, format="PNG")
+                for background in backgrounds:
+                    if background is not None:
+                        path = os.path.join(directory, f"{len(batch):04d}.png")
+                        background.frame.save(path, format="PNG")
+                        batch.append(path)
             except OSError as e:
                 log_error(f"Cannot write the preloaded batch to {PRELOAD_DIR} ({e})")
                 break
-            batch.append(path)
         if not batch:
             shutil.rmtree(directory, ignore_errors=True)
         failed = len(candidates) - len(portraits) - len(landscapes)
