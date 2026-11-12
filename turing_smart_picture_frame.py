@@ -3,6 +3,20 @@
 # Based on turing-smart-screen-python library
 #
 # Changelog:
+# 1.0.14 - --images can be repeated to show the images of several directories (--images A --images B);
+#          each one must exist and be readable. Directories are resolved to their canonical path and a
+#          directory given twice (same device/inode) is used once; an image path found through more than
+#          one directory (nested directories) is discovered once; the same file under different paths
+#          (symlink, hardlink) counts once per path. --preload-images samples from all directories
+#          together. During --auto-refresh each directory has its own identity check: a directory that
+#          cannot be read or whose identity changed keeps its known images while the others are rescanned,
+#          also when none of them can be read (a single directory included). An empty --images path is
+#          rejected instead of meaning the current directory. Known images are kept only when the
+#          most specific directory containing them could not be read, so a nested directory rescanned
+#          successfully is not overridden by an unreadable parent. Kept images whose file is missing (e.g.
+#          an unmounted share) are unavailable: not sampled, queued or opened, logged once as a count
+#          instead of one error per image, and back in the rotation when their directory can be read again;
+#          while no image is available the default background is shown
 # 1.0.13 - Image changes aligned to the clock: the first image is shown at startup, every following change
 #          happens at a multiple of --interval counted from local midnight (30 -> :00 and :30, 1h -> X:00:00).
 #          --interval accepts seconds or a number with unit s/m/h/d (30, 5m, 1h, 1d) and only values that
@@ -91,7 +105,8 @@ to fit the display. Portrait images are displayed in pairs side-by-side.
 Features:
 - Automatic image rotation at configurable intervals, aligned to the clock (multiples of the interval
   counted from local midnight)
-- Optional periodic rescan of the source directory (--auto-refresh)
+- One or more source directories (--images, repeatable)
+- Optional periodic rescan of the source directories (--auto-refresh)
 - Support for multiple display hardware revisions (A, B, C, D, SIMU)
 - Time and date overlay on displayed images
 - Recursive directory searching for images
@@ -101,7 +116,7 @@ Configuration:
 1. Command Line Arguments:
    --debug       : Enable debug output (more verbose logging)
    --images PATH : Existing, readable directory containing images; the program exits with an error
-                   otherwise (default: './images')
+                   otherwise. Repeat it for several directories: --images A --images B (default: './images')
    --recursive   : Search for images recursively in subdirectories
    --font NAME|PATH: Font for the time/date overlay: bundled font name (folder name in
                    res/fonts, e.g. pacifico) or path to a custom .ttf/.otf (default: dejavu)
@@ -109,10 +124,10 @@ Configuration:
    --interval DURATION: Time between image changes, aligned to its multiples from local midnight: seconds
                    or a number with unit s/m/h/d (e.g. 30, 5m, 1h, 1d); multiples of 5 s dividing an hour
                    or whole hours dividing a day (default: 30)
-   --auto-refresh [DURATION]: Rescan the images directory every DURATION, seconds or a number with
+   --auto-refresh [DURATION]: Rescan the images directories every DURATION, seconds or a number with
                    unit s/m/h/d (e.g. 600, 30m, 2h), from 1s to 365d; default without a value: 1h; omitted = no rescan
-   --preload-images N: Use only N random images of the discovered ones, re-sampled after
-                   all of them have been shown (default: 0 = no limit)
+   --preload-images N: Use only N random images of the discovered ones (all directories together),
+                   re-sampled after all of them have been shown (default: 0 = no limit)
    --revision REV: Display hardware revision: A, B, C, D or SIMU (default: A)
    --port PORT   : Serial port, e.g. /dev/ttyACM0, or AUTO for auto-detection (default: AUTO)
    --brightness N: Display brightness 0-100 (default: 50)
@@ -134,7 +149,7 @@ Configuration:
    - WIDTH, HEIGHT: Display dimensions in portrait mode (default: 320x480)
 
 Usage:
-1. Place images in the 'images' directory (or specify custom path with --images)
+1. Place images in the 'images' directory (or specify one or more custom paths with --images)
 2. Run script: python3 turing-smart-picture-frame.py [options]
    or, once installed with 'pipx install .': turing-smart-picture-frame [options]
 3. Press Ctrl+C to exit gracefully
@@ -164,9 +179,11 @@ Notes:
   from local midnight. Every allowed interval divides a day, so each day starts aligned at 00:00:00.
   Multiples follow the local wall clock, also across daylight saving changes and clock adjustments.
 - --auto-refresh adds new images to the end of the rotation queue and removes deleted ones; with
-  --preload-images new images enter the next random sample. If the images directory cannot be read
-  during a rescan, the current images are kept; unreadable subdirectories are skipped and the images
-  already known under them are kept.
+  --preload-images new images enter the next random sample. If an images directory cannot be read
+  during a rescan, or its device/inode identity changed, the images already known in it are kept while
+  the other directories are rescanned; unreadable subdirectories are skipped and the images already
+  known under them are kept. Kept images whose file is missing (e.g. an unmounted share) are left out
+  of the rotation and the samples until their directory can be read again.
 """
 
 import os
@@ -181,6 +198,7 @@ import hashlib
 import re
 from collections import namedtuple
 from functools import partial
+from itertools import chain
 import logging
 from datetime import datetime
 from importlib.resources import files
@@ -195,7 +213,7 @@ from library.lcd.lcd_comm_rev_d import LcdCommRevD
 from library.lcd.lcd_simulated import LcdSimulated
 from library.log import APP_DIR, LOG_FILE, logger
 
-__version__ = "1.0.13"
+__version__ = "1.0.14"
 
 # Configuration (defaults of the command line options)
 COM_PORT = "AUTO"  # Set your COM port or "AUTO" for auto-discovery
@@ -384,6 +402,12 @@ def under_any(path, directories):
     """True if path is inside one of directories"""
     return any(path.startswith(os.path.join(directory, "")) for directory in directories)
 
+def retained(path, unreadable, scanned):
+    """True if a known image at path was not rescanned because the most specific directory containing it,
+    among the unreadable directories and the successfully scanned source directories, is unreadable"""
+    owners = [directory for directory in chain(unreadable, scanned) if under_any(path, (directory,))]
+    return bool(owners) and max(owners, key=len) in unreadable
+
 class OrientationCache:
     """Thread-safe memo of image classifications, shared by the rotation and refresh threads; the
     single source of truth for them.
@@ -457,16 +481,18 @@ class OrientationCache:
             log_debug(f"{kind.capitalize()}: {os.path.basename(image_path)} ({width}x{height})")
         return kind
 
-    def prune(self, present, unreadable=()):
-        """Forget classifications and errors of images that are no longer discovered; entries under
-        unreadable directories are kept"""
+    def prune(self, present, unreadable=(), scanned=()):
+        """Forget classifications and errors of images that are no longer discovered; entries retained
+        under unreadable directories (see retained()) are kept"""
+        unreadable = set(unreadable)
         with self.lock:
             for path in self.kinds.keys() - present:
-                if not under_any(path, unreadable):
+                if not retained(path, unreadable, scanned):
                     del self.kinds[path]
-            self.errors = {path for path in self.errors if path in present or under_any(path, unreadable)}
+            self.errors = {path for path in self.errors
+                           if path in present or retained(path, unreadable, scanned)}
             for path in self.invalid.keys() - present:
-                if not under_any(path, unreadable):
+                if not retained(path, unreadable, scanned):
                     del self.invalid[path]
 
 class ImageManager:
@@ -479,11 +505,13 @@ class ImageManager:
     offer_scan(); get_next_image() applies it. No lock guards the queues because no other thread
     touches them."""
 
-    def __init__(self, source_images_dir, cache, recursive_search=False, display_width=320, display_height=480,
+    def __init__(self, source_dirs, cache, recursive_search=False, display_width=320, display_height=480,
                  preload_images=0):
-        self.source_images_dir = source_images_dir
-        source_stat = os.stat(source_images_dir)
-        self.source_identity = (source_stat.st_dev, source_stat.st_ino)
+        self.source_dirs = list(source_dirs)
+        self.source_identities = {}
+        for source_dir in self.source_dirs:
+            source_stat = os.stat(source_dir)
+            self.source_identities[source_dir] = (source_stat.st_dev, source_stat.st_ino)
         self.cache = cache
         self.recursive_search = recursive_search
         self.display_width = display_width
@@ -491,6 +519,7 @@ class ImageManager:
         self.preload_images = preload_images
 
         self.discovered_images = []
+        self.unavailable_images = []
         self.image_list = ()
         self.portrait_images = []
         self.landscape_images = []
@@ -504,68 +533,83 @@ class ImageManager:
         self.load_images()
 
     def load_images(self):
-        """Scan directory for supported image files and categorize by orientation"""
-        log_info(f"Scanning for images in: {os.path.abspath(self.source_images_dir)}")
+        """Scan the source directories for supported image files and categorize them by orientation.
+        An image path found through more than one source directory (nested directories) is discovered
+        once; the same file under different paths (symlink, hardlink) is discovered under each path."""
         log_info(f"Recursive search: {'enabled' if self.recursive_search else 'disabled'}")
 
-        self.discovered_images = list(self.find_images())
+        discovered = {}
+        for source_dir in self.source_dirs:
+            log_info(f"Scanning for images in: {source_dir}")
+            images = list(self.find_images(source_dir))
+            log_info(f"Found {len(images)} images in {source_dir}")
+            if self.recursive_search:
+                subdirs = {os.path.dirname(os.path.relpath(img_path, source_dir)) for img_path in images}
+                subdirs.discard('')
+                if subdirs:
+                    log_info(f"Images found in subdirectories of {source_dir}: {', '.join(sorted(subdirs))}")
+            discovered.update(dict.fromkeys(images))
+        self.discovered_images = list(discovered)
 
         if not self.discovered_images:
-            log_warning(f"No images found in {self.source_images_dir} directory")
+            log_warning(f"No images found in {', '.join(self.source_dirs)}")
             self.create_default_image()
         else:
-            log_info(f"Found {len(self.discovered_images)} images in {self.source_images_dir}")
-            if self.recursive_search:
-                # Show which subdirectories contain images
-                subdirs = set()
-                for img_path in self.discovered_images:
-                    subdir = os.path.dirname(os.path.relpath(img_path, self.source_images_dir))
-                    if subdir and subdir != '.':
-                        subdirs.add(subdir)
-                if subdirs:
-                    log_info(f"Images found in subdirectories: {', '.join(sorted(subdirs))}")
-
+            if len(self.source_dirs) > 1:
+                log_info(f"Found {len(self.discovered_images)} images in {len(self.source_dirs)} directories")
             self.select_sample()
 
-    def find_images(self, onerror=None):
-        """Yield supported image files (extension matched case-insensitively), skipping hidden files/dirs.
+    def find_images(self, source_dir, onerror=None):
+        """Yield supported image files of source_dir (extension matched case-insensitively), skipping
+        hidden files/dirs.
 
         onerror is passed to os.walk: by default unreadable directories are skipped silently."""
-        for root, dirs, filenames in os.walk(self.source_images_dir, onerror=onerror):
+        for root, dirs, filenames in os.walk(source_dir, onerror=onerror):
             dirs[:] = sorted(d for d in dirs if not d.startswith('.')) if self.recursive_search else []
             for name in sorted(filenames):
                 if not name.startswith('.') and os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
                     yield os.path.join(root, name)
 
     def scan(self):
-        """Scan the source directory for the refresh thread; modifies no rotation state.
+        """Scan the source directories for the refresh thread; modifies no rotation state.
 
-        Returns (discovered images, unreadable subdirectories), or None if the images directory itself
-        cannot be read. Unreadable subdirectories (e.g. lost+found at a mount point) are skipped; the
-        images already known under them are kept by apply_scan(), so a partial scan is not mistaken for
-        deleted images. The images that can rotate (rotation_pool: all
+        Returns (discovered images, unreadable directories). A source directory that cannot be read or whose device/inode identity changed, and
+        unreadable subdirectories (e.g. lost+found at a mount point), are skipped; the images already
+        known under them are kept by apply_scan() (see retained()), so a partial scan is not mistaken
+        for deleted images. A source directory scanned successfully is never reported as unreadable,
+        also when another source directory's walk could not read it.
+        The images that can rotate (rotation_pool: all
         discovered, or the current sample from the image_list tuple) are classified here, so the files
         are opened on the refresh thread; apply_scan() then finds them in the OrientationCache with a
         single os.stat. The cache is pruned to this scan."""
         unreadable = []
-        top = os.path.normpath(self.source_images_dir)
+        scanned = []
+        found = {}
+        for source_dir, identity in self.source_identities.items():
+            top = os.path.normpath(source_dir)
 
-        def skip_unreadable(error):
-            if os.path.normpath(error.filename) == top:
-                raise error
-            unreadable.append(error.filename)
-            log_debug(f"Auto refresh: skipping unreadable directory {error.filename}: {error}")
+            def skip_unreadable(error, top=top):
+                if os.path.normpath(error.filename) == top:
+                    raise error
+                unreadable.append(error.filename)
+                log_debug(f"Auto refresh: skipping unreadable directory {error.filename}: {error}")
 
-        try:
-            source_stat = os.stat(self.source_images_dir)
-            if (source_stat.st_dev, source_stat.st_ino) != self.source_identity:
-                log_warning("Auto refresh: source directory identity changed; keeping the current images")
-                return None
-            discovered = list(self.find_images(onerror=skip_unreadable))
-        except OSError as e:
-            log_warning(f"Auto refresh: cannot read {self.source_images_dir} ({e}), keeping the current images")
-            return None
-        self.orientations.prune(set(discovered), unreadable)
+            try:
+                source_stat = os.stat(source_dir)
+                if (source_stat.st_dev, source_stat.st_ino) != identity:
+                    log_warning(f"Auto refresh: identity of {source_dir} changed; keeping its current images")
+                    unreadable.append(source_dir)
+                    continue
+                images = list(self.find_images(source_dir, onerror=skip_unreadable))
+            except OSError as e:
+                log_warning(f"Auto refresh: cannot read {source_dir} ({e}), keeping its current images")
+                unreadable.append(source_dir)
+                continue
+            scanned.append(source_dir)
+            found.update(dict.fromkeys(images))
+        unreadable =[directory for directory in dict.fromkeys(unreadable) if directory not in scanned]
+        discovered = list(found)
+        self.orientations.prune(set(discovered), unreadable, scanned)
         for image_path in self.rotation_pool(discovered):
             self.orientations.classify(image_path)
         return discovered, unreadable
@@ -593,25 +637,43 @@ class ImageManager:
         """Apply a rescan: deleted images leave the queues, new ones join the end of their queue in random
         order (with --preload-images they can enter the next sample); the default background is used
         while no images exist. The new state is computed first and assigned at the end, so a failure
-        leaves the previous state intact and the next rescan retries it. Known images under unreadable
-        subdirectories stay discovered."""
+        leaves the previous state intact and the next rescan retries it.
+
+        Known images retained under unreadable directories (see retained()) are not forgotten: those whose
+        file still exists stay discovered, those whose file is missing (e.g. an unmounted share) become
+        unavailable_images, which are neither sampled nor queued nor opened, and return to the rotation
+        when a rescan finds them again."""
+        unreadable = set(unreadable)
+        scanned = [source_dir for source_dir in self.source_dirs if source_dir not in unreadable]
         found = set(discovered)
-        discovered = discovered + [image_path for image_path in self.discovered_images if image_path not in found
-                                   and under_any(image_path, unreadable)]
-        previous = set(self.discovered_images)
-        current = set(discovered)
-        self.cache.prune_hashes(discovered)
+        kept = [image_path for image_path in self.discovered_images + self.unavailable_images
+                if image_path not in found and retained(image_path, unreadable, scanned)]
+        exists = {image_path: os.path.exists(image_path) for image_path in kept}
+        discovered = discovered + [image_path for image_path in kept if exists[image_path]]
+        unavailable = [image_path for image_path in kept if not exists[image_path]]
+        previous = set(self.discovered_images) | set(self.unavailable_images)
+        current = set(discovered) | set(unavailable)
+        self.cache.prune_hashes(discovered + unavailable)
         added, removed = len(current - previous), len(previous - current)
+        if not unavailable and self.unavailable_images:
+            log_info("Auto refresh: no images are unavailable any more")
+        elif len(unavailable) != len(self.unavailable_images):
+            log_warning(f"Auto refresh: {len(unavailable)} images in unreadable directories are unavailable "
+                        "until they can be read again")
+        elif unavailable:
+            log_debug(f"Auto refresh: {len(unavailable)} images still unavailable")
 
         if not discovered:
             default_background = self.default_background or self.prepare_default_background()
+            had_images = bool(self.discovered_images)
             self.discovered_images = discovered
+            self.unavailable_images = unavailable
             self.image_list = ()
             self.portrait_images = []
             self.landscape_images = []
             self.default_background = default_background
-            if previous:
-                log_warning(f"Auto refresh: no images left in {self.source_images_dir}")
+            if had_images:
+                log_warning(f"Auto refresh: no images left in {', '.join(self.source_dirs)}")
             else:
                 log_debug("Auto refresh: still no images")
             return
@@ -631,6 +693,7 @@ class ImageManager:
                                                           kept_landscapes + new_landscapes, portraits)
 
         self.discovered_images = discovered
+        self.unavailable_images = unavailable
         self.default_background = None
         self.image_list = tuple(pool)
         self.portrait_images = portrait_images
@@ -1323,7 +1386,7 @@ def background_rotation_thread(image_manager):
     log_debug("Background rotation thread stopped")
 
 def source_refresh_thread(image_manager):
-    """Thread function rescanning the images directory every AUTO_REFRESH seconds.
+    """Thread function rescanning the images directories every AUTO_REFRESH seconds.
 
     It only scans and classifies the images that can rotate; the result is handed to the rotation
     thread with image_manager.offer_scan(), and the rotation thread applies it to the queues."""
@@ -1331,10 +1394,8 @@ def source_refresh_thread(image_manager):
 
     while not stop_event.wait(AUTO_REFRESH):
         try:
-            log_debug("Rescanning images directory...")
-            result = image_manager.scan()
-            if result is not None:
-                image_manager.offer_scan(result)
+            log_debug("Rescanning images directories...")
+            image_manager.offer_scan(image_manager.scan())
         except Exception as e:
             log_error(f"Error in auto refresh: {e}")
             log_debug(f"Exception details: {type(e).__name__}: {str(e)}")
@@ -1406,13 +1467,26 @@ def int_range(minimum, maximum=None):
     return parse
 
 def source_directory(value):
-    """argparse type: path ('~' expanded) of an existing, readable directory; it is never created"""
-    path = os.path.expanduser(value)
+    """argparse type: canonical path ('~' expanded, symlinks resolved) of an existing, readable
+    directory; it is never created"""
+    if not value:
+        raise argparse.ArgumentTypeError("empty path")
+    path = os.path.realpath(os.path.expanduser(value))
     if not os.path.isdir(path):
         raise argparse.ArgumentTypeError(f"'{value}' does not exist or is not a directory")
     if not os.access(path, os.R_OK | os.X_OK):
         raise argparse.ArgumentTypeError(f"'{value}' is not readable")
     return path
+
+def source_directories(values):
+    """Validated source directories (see source_directory) in the given order, without repeating a
+    directory given more than once (same device/inode, e.g. through another path or a bind mount)"""
+    directories = {}
+    for value in values:
+        path = source_directory(value)
+        source_stat = os.stat(path)
+        directories.setdefault((source_stat.st_dev, source_stat.st_ino), path)
+    return list(directories.values())
 
 def parse_duration(value):
     """Seconds in a duration: a plain number of seconds, or a number followed by s, m, h or d
@@ -1459,9 +1533,10 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Turing Smart Screen Image Slideshow")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug output (default: INFO level only)")
-    parser.add_argument("--images", default="images", metavar="PATH",
-                       help="Path to an existing, readable images directory (default: 'images' in current "
-                            "location)")
+    parser.add_argument("--images", action="append", metavar="PATH",
+                       help="Path to an existing, readable images directory; repeat it to show the images of "
+                            "several directories, e.g. --images DIR1 --images DIR2 (default: 'images' in "
+                            "current location)")
     parser.add_argument("--recursive", action="store_true",
                        help="Search for images recursively in subdirectories")
     parser.add_argument("--font", type=font_file, default=DEFAULT_FONT, metavar="NAME|PATH",
@@ -1477,14 +1552,15 @@ def parse_arguments():
                             f"(default: {IMAGE_ROTATION_INTERVAL})")
     parser.add_argument("--auto-refresh", type=duration_range(1, MAX_AUTO_REFRESH), nargs="?", const=AUTO_REFRESH_DEFAULT,
                        default=AUTO_REFRESH, metavar="DURATION",
-                       help="Rescan the images directory for new or deleted images every DURATION, without "
+                       help="Rescan the images directories for new or deleted images every DURATION, without "
                             "interrupting the slideshow: seconds or a number with unit s/m/h/d (e.g. 600, 30m, "
                             f"2h, 1d), up to {format_duration(MAX_AUTO_REFRESH)}; without a value every "
                             f"{format_duration(AUTO_REFRESH_DEFAULT)} "
                             "(default: no rescan)")
     parser.add_argument("--preload-images", type=int_range(0), default=PRELOAD_IMAGES, metavar="N",
-                       help="Use only N random images of the discovered ones, re-sampled after all of them "
-                            f"have been shown; 0 = no limit (default: {PRELOAD_IMAGES})")
+                       help="Use only N random images of the discovered ones (of all --images directories "
+                            "together), re-sampled after all of them have been shown; 0 = no limit "
+                            f"(default: {PRELOAD_IMAGES})")
     parser.add_argument("--revision", type=str.upper, choices=REVISIONS, default=REVISION,
                        help=f"Display hardware revision (default: {REVISION})")
     parser.add_argument("--port", default=COM_PORT,
@@ -1517,7 +1593,7 @@ def parse_arguments():
     args = parser.parse_args()
     if not args.font_list:
         try:
-            args.images = source_directory(args.images)
+            args.images = source_directories(args.images or ["images"])
         except argparse.ArgumentTypeError as e:
             parser.error(f"argument --images: {e}")
     return args
@@ -1526,7 +1602,7 @@ def log_configuration(args):
     """Log every option with its effective value, defaults included"""
     settings = {f"--{dest.replace('_', '-')}": value
                 for dest, value in vars(args).items() if dest != "font_list"}
-    settings["--images"] = os.path.abspath(args.images)
+    settings["--images"] = ", ".join(args.images)
     settings["cache dir"] = CACHE_DIR
     settings["log file"] = LOG_FILE
     width = max(len(name) for name in settings)
@@ -1583,7 +1659,7 @@ def main():
 
         # Create image manager with command line arguments
         cache = ImageCache(CACHE_DIR, args.cache_size * 1024 * 1024)
-        image_manager = ImageManager(source_images_dir=args.images,
+        image_manager = ImageManager(source_dirs=args.images,
                                    cache=cache,
                                    recursive_search=args.recursive,
                                    display_width=lcd_comm.get_width(),

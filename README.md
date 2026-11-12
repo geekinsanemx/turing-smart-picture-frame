@@ -8,9 +8,10 @@ The display communication code in `library/` comes from [turing-smart-screen-pyt
 
 - Landscape images are cropped to fill the screen; portrait images are shown in pairs side by side
 - Random rotation every `--interval` (default 30 seconds; `5m`, `1h`, ... also accepted), aligned to the clock (see [Clock-aligned rotation](#clock-aligned-rotation))
-- Optional periodic rescan of the images directory (`--auto-refresh`)
+- Images from one or more directories (`--images`, repeatable)
+- Optional periodic rescan of the images directories (`--auto-refresh`)
 - Time (refreshed every second), date and day of week overlay in the bottom right corner
-- Optional recursive search of the images directory
+- Optional recursive search of the images directories
 - Gradient default background when no images are found
 
 ## Supported hardware
@@ -58,7 +59,7 @@ python3 -m venv .venv
 ## Usage
 
 ```bash
-turing-smart-picture-frame [--images PATH] [--recursive] [--preload-images N] [--interval DURATION]
+turing-smart-picture-frame [--images PATH [--images PATH ...]] [--recursive] [--preload-images N] [--interval DURATION]
                            [--auto-refresh [DURATION]] [--font NAME|PATH] [--font-list] [--time-size N] [--date-size N] [--day-size N]
                            [--revision {A,B,C,D,SIMU}] [--port PORT] [--brightness 0-100]
                            [--text-contrast MODE] [--scale-mode MODE] [--max-crop PCT]
@@ -67,11 +68,11 @@ turing-smart-picture-frame [--images PATH] [--recursive] [--preload-images N] [-
 
 | Option | Description |
 |---|---|
-| `--images PATH` | Images directory; it must exist and be readable, otherwise the program exits with an error (default: `images` in the current directory) |
+| `--images PATH` | Images directory; it must exist and be readable, otherwise the program exits with an error. Repeat it to show the images of several directories: `--images DIR1 --images DIR2`. A directory given twice (also through a symlink or a bind mount) is used once, and an image path found through more than one directory (nested directories) is shown once; the same file under different paths (symlink, hardlink) is shown once per path (default: `images` in the current directory) |
 | `--recursive` | Search images in subdirectories |
-| `--preload-images N` | Use only N random images of the discovered ones; a new random sample is taken once all of them have been shown. Only the sampled images are opened, so startup stays fast with thousands of images (default: `0` = no limit) |
+| `--preload-images N` | Use only N random images of the discovered ones (of all `--images` directories together); a new random sample is taken once all of them have been shown. Only the sampled images are opened, so startup stays fast with thousands of images (default: `0` = no limit) |
 | `--interval DURATION` | Time between image changes, at its multiples counted from local midnight: seconds or a number with unit `s`/`m`/`h`/`d` (`30`, `5m`, `1h`, `1d`); only round clock intervals from 5 s to 1 day are accepted (default: `30`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
-| `--auto-refresh [DURATION]` | Rescan the images directory for new or deleted images every DURATION, without interrupting the slideshow: seconds or a number with unit `s`/`m`/`h`/`d` (`600`, `30m`, `2h`, `1d`), up to `365d`; without a value every `1h` (default: no rescan, see [Auto refresh](#auto-refresh)) |
+| `--auto-refresh [DURATION]` | Rescan the images directories for new or deleted images every DURATION, without interrupting the slideshow: seconds or a number with unit `s`/`m`/`h`/`d` (`600`, `30m`, `2h`, `1d`), up to `365d`; without a value every `1h` (default: no rescan, see [Auto refresh](#auto-refresh)) |
 | `--font NAME\|PATH` | Font for the time/date overlay: a bundled font name (see [Fonts](#fonts), case-insensitive) or the path to a custom `.ttf`/`.otf` file (default: `dejavu`) |
 | `--font-list` | List the bundled fonts usable as `--font NAME` and exit |
 | `--time-size N` / `--date-size N` / `--day-size N` | Overlay font sizes (default: `34` / `22` / `24`) |
@@ -97,6 +98,9 @@ turing-smart-picture-frame --images ~/Pictures --recursive --preload-images 100 
 
 # custom font: give its path
 turing-smart-picture-frame --images ~/Pictures --font ~/fonts/MyFont.ttf
+
+# several directories
+turing-smart-picture-frame --images /path/to/photos --images /path/to/wallpapers --recursive
 ```
 
 Supported formats: PNG, JPG/JPEG, BMP, GIF. Press Ctrl+C to exit.
@@ -133,13 +137,14 @@ Changes follow the local wall clock: across daylight saving changes the multiple
 
 ### Auto refresh
 
-`--auto-refresh [DURATION]` rescans the images directory every DURATION (every hour when given without a value) in a separate thread; the clock and the rotation keep running during the scan. DURATION uses the same syntax as `--interval` (`600`, `30m`, `2h`, `1d`), with values from 1 second to 365 days accepted; rescans are not aligned to the clock.
+`--auto-refresh [DURATION]` rescans the images directories every DURATION (every hour when given without a value) in a separate thread; the clock and the rotation keep running during the scan. DURATION uses the same syntax as `--interval` (`600`, `30m`, `2h`, `1d`), with values from 1 second to 365 days accepted; rescans are not aligned to the clock.
 
 - New images are added to the end of the rotation queue; deleted images are removed from it
 - With `--preload-images`, deleted images leave the current sample and new images can enter the next sample
 - Only new or modified files are opened; the orientation of known images is remembered
 - If no images can be displayed (empty source, unsupported coverage or unreadable files), the default background is shown until usable images become available
-- If the images directory cannot be read, or its device/inode identity changes (for example after unmounting a share), the rescan is discarded and the current images are kept; unreadable subdirectories (e.g. `lost+found` at a mount point) are skipped and the images already known under them are kept
+- If an images directory cannot be read, or its device/inode identity changes (for example after unmounting a share), the images already known in it are kept while the other `--images` directories are rescanned (also when there is only one, or none of them can be read). Unreadable subdirectories (e.g. `lost+found` at a mount point) are skipped and the images already known under them are kept. A nested `--images` directory that can be read is rescanned normally even when its parent cannot
+- Known images whose file is missing because their directory cannot be read (e.g. an unmounted share) are left out of the rotation and of `--preload-images` samples, and are not opened; the log shows how many are unavailable. They return to the rotation once their directory can be read again; while no image is available, the default background is shown
 - An image replaced at the same path with a different orientation (portrait/landscape) moves to the matching queue
 - Unreadable images are excluded and retried during refresh. A file that fails full decoding is excluded for its current metadata version and retried after it changes, avoiding repeated decode failures for unchanged truncated files.
 - The image prepared for the next change was selected before the rescan, so changes take effect from the change after it
@@ -167,7 +172,7 @@ Each image is resized/cropped for the screen the first time it is shown and stor
 
 When the cache exceeds `--cache-size` MB, the least recently used files are deleted. The cache can also be removed manually at any time.
 
-Nothing is written to the current directory or to the images directory. Other runtime files are also kept in `$XDG_CACHE_HOME/tspf/` (default `~/.cache/tspf/`): `log.log` (max 1 MB), and with `--revision SIMU` the `simu/` subdirectory (`screencap.png`, `tmp`). The cache size limit only counts processed images, so these files are never deleted by it.
+Nothing is written to the current directory or to the images directories. Other runtime files are also kept in `$XDG_CACHE_HOME/tspf/` (default `~/.cache/tspf/`): `log.log` (max 1 MB), and with `--revision SIMU` the `simu/` subdirectory (`screencap.png`, `tmp`). The cache size limit only counts processed images, so these files are never deleted by it.
 
 ## Fonts
 
