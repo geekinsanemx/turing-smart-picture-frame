@@ -16,7 +16,8 @@
 #          successfully is not overridden by an unreadable parent. Kept images whose file is missing (e.g.
 #          an unmounted share) are unavailable: not sampled, queued or opened, logged once as a count
 #          instead of one error per image, and back in the rotation when their directory can be read again;
-#          while no image is available the default background is shown
+#          while no image is available the default background is shown.
+#          Default --interval (IMAGE_ROTATION_INTERVAL) changed from 30 to 60 seconds
 # 1.0.13 - Image changes aligned to the clock: the first image is shown at startup, every following change
 #          happens at a multiple of --interval counted from local midnight (30 -> :00 and :30, 1h -> X:00:00).
 #          --interval accepts seconds or a number with unit s/m/h/d (30, 5m, 1h, 1d) and only values that
@@ -123,7 +124,7 @@ Configuration:
    --font-list   : List the bundled fonts usable as --font NAME and exit
    --interval DURATION: Time between image changes, aligned to its multiples from local midnight: seconds
                    or a number with unit s/m/h/d (e.g. 30, 5m, 1h, 1d); multiples of 5 s dividing an hour
-                   or whole hours dividing a day (default: 30)
+                   or whole hours dividing a day (default: 60)
    --auto-refresh [DURATION]: Rescan the images directories every DURATION, seconds or a number with
                    unit s/m/h/d (e.g. 600, 30m, 2h), from 1s to 365d; default without a value: 1h; omitted = no rescan
    --preload-images N: Use only N random images of the discovered ones (all directories together),
@@ -220,7 +221,7 @@ COM_PORT = "AUTO"  # Set your COM port or "AUTO" for auto-discovery
 REVISION = "A"     # Display revision (A, B, C, D, or SIMU)
 REVISIONS = ("A", "B", "C", "D", "SIMU")
 WIDTH, HEIGHT = 320, 480  # Display dimensions in portrait mode
-IMAGE_ROTATION_INTERVAL = 30
+IMAGE_ROTATION_INTERVAL = 60
 SECONDS_PER_HOUR, SECONDS_PER_DAY = 3600, 86400
 DURATION_UNITS = {"s": 1, "m": 60, "h": SECONDS_PER_HOUR, "d": SECONDS_PER_DAY}
 MIN_INTERVAL = 5

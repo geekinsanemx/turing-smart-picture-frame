@@ -7,7 +7,7 @@ The display communication code in `library/` comes from [turing-smart-screen-pyt
 ## Features
 
 - Landscape images are cropped to fill the screen; portrait images are shown in pairs side by side
-- Random rotation every `--interval` (default 30 seconds; `5m`, `1h`, ... also accepted), aligned to the clock (see [Clock-aligned rotation](#clock-aligned-rotation))
+- Random rotation every `--interval` (default 60 seconds; `5m`, `1h`, ... also accepted), aligned to the clock (see [Clock-aligned rotation](#clock-aligned-rotation))
 - Images from one or more directories (`--images`, repeatable)
 - Optional periodic rescan of the images directories (`--auto-refresh`)
 - Time (refreshed every second), date and day of week overlay in the bottom right corner
@@ -71,7 +71,7 @@ turing-smart-picture-frame [--images PATH [--images PATH ...]] [--recursive] [--
 | `--images PATH` | Images directory; it must exist and be readable, otherwise the program exits with an error. Repeat it to show the images of several directories: `--images DIR1 --images DIR2`. A directory given twice (also through a symlink or a bind mount) is used once, and an image path found through more than one directory (nested directories) is shown once; the same file under different paths (symlink, hardlink) is shown once per path (default: `images` in the current directory) |
 | `--recursive` | Search images in subdirectories |
 | `--preload-images N` | Use only N random images of the discovered ones (of all `--images` directories together); a new random sample is taken once all of them have been shown. Only the sampled images are opened, so startup stays fast with thousands of images (default: `0` = no limit) |
-| `--interval DURATION` | Time between image changes, at its multiples counted from local midnight: seconds or a number with unit `s`/`m`/`h`/`d` (`30`, `5m`, `1h`, `1d`); only round clock intervals from 5 s to 1 day are accepted (default: `30`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
+| `--interval DURATION` | Time between image changes, at its multiples counted from local midnight: seconds or a number with unit `s`/`m`/`h`/`d` (`30`, `5m`, `1h`, `1d`); only round clock intervals from 5 s to 1 day are accepted (default: `60`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
 | `--auto-refresh [DURATION]` | Rescan the images directories for new or deleted images every DURATION, without interrupting the slideshow: seconds or a number with unit `s`/`m`/`h`/`d` (`600`, `30m`, `2h`, `1d`), up to `365d`; without a value every `1h` (default: no rescan, see [Auto refresh](#auto-refresh)) |
 | `--font NAME\|PATH` | Font for the time/date overlay: a bundled font name (see [Fonts](#fonts), case-insensitive) or the path to a custom `.ttf`/`.otf` file (default: `dejavu`) |
 | `--font-list` | List the bundled fonts usable as `--font NAME` and exit |
