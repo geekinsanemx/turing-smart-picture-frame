@@ -71,7 +71,7 @@ turing-smart-picture-frame [--images PATH [--images PATH ...]] [--recursive] [--
 |---|---|
 | `--images PATH` | Images directory; it must exist and be readable, otherwise the program exits with an error. Repeat it to show the images of several directories: `--images DIR1 --images DIR2`. A directory given twice (also through a symlink or a bind mount) is used once; with `--recursive`, a directory inside another `--images` directory (compared by real path, not inside a hidden directory) is ignored, since the recursive search already reads it; the same file under different paths (symlink, hardlink) is shown once per path (default: `images` in the current directory) |
 | `--recursive` | Search images in subdirectories |
-| `--preload-images [N]` | Process batches of N random images (of all `--images` directories together) in advance into `$XDG_CACHE_HOME/tspf/preload/` and show them from there, without reading the source files; without a value `100`. Not given or `0`: each image is processed when its turn comes (default: `0`, see [Preloading](#preloading)) |
+| `--preload-images [N]` | Process batches of N random images (of all `--images` directories together) in advance into `$XDG_CACHE_HOME/tspf/preload/` and show them from there, without reading the source files; without a value `100`, at most `1000`. Not given or `0`: each image is processed when its turn comes (default: `0`, see [Preloading](#preloading)) |
 | `--interval DURATION` | Time between image changes, at its multiples counted from local midnight: seconds or a number with unit `s`/`m`/`h`/`d` (`30`, `5m`, `1h`, `1d`); only round clock intervals from 5 s to 1 day are accepted (default: `60`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
 | `--auto-refresh [DURATION]` | Rescan the images directories for new or deleted images every DURATION, without interrupting the slideshow: seconds or a number with unit `s`/`m`/`h`/`d` (`600`, `30m`, `2h`, `1d`), up to `365d`; without a value every `1h` (default: no rescan, see [Auto refresh](#auto-refresh)) |
 | `--font NAME\|PATH` | Font for the time/date overlay: a bundled font name (see [Fonts](#fonts), case-insensitive) or the path to a custom `.ttf`/`.otf` file (default: `dejavu`) |
@@ -106,7 +106,7 @@ turing-smart-picture-frame --images /path/to/photos --images /path/to/wallpapers
 
 Supported formats: PNG, JPG/JPEG, BMP, GIF. Press Ctrl+C to exit.
 
-Defaults are set at the top of `turing_smart_picture_frame.py`: `COM_PORT`, `REVISION`, `IMAGE_ROTATION_INTERVAL`, `AUTO_REFRESH`, `AUTO_REFRESH_DEFAULT`, `PRELOAD_IMAGES`, `PRELOAD_IMAGES_DEFAULT`, `BRIGHTNESS`, `CACHE_DIR`, `CACHE_SIZE_MB`, `TIME_STYLE`/`DATE_STYLE`/`DAY_STYLE` (size, color on dark and on light backgrounds), `TEXT_CONTRAST`, `OUTLINE_WIDTH`, `BOX_ALPHA`, `SCALE_MODE`, `MAX_CROP`, `MIN_COVERAGE`, `BLUR_RADIUS`, `BLUR_BRIGHTNESS`, `OVERLAY_MARGIN`, `OVERLAY_LINE_GAP`, `WIDTH`/`HEIGHT`. When installed, re-run `pipx install --force .` after changing them.
+Defaults are set at the top of `turing_smart_picture_frame.py`: `COM_PORT`, `REVISION`, `IMAGE_ROTATION_INTERVAL`, `AUTO_REFRESH`, `AUTO_REFRESH_DEFAULT`, `PRELOAD_IMAGES`, `PRELOAD_IMAGES_DEFAULT`, `MAX_PRELOAD_IMAGES`, `SELECTION_TIMEOUT`, `DROPPED_RETRY`, `BRIGHTNESS`, `CACHE_DIR`, `CACHE_SIZE_MB`, `TIME_STYLE`/`DATE_STYLE`/`DAY_STYLE` (size, color on dark and on light backgrounds), `TEXT_CONTRAST`, `OUTLINE_WIDTH`, `BOX_ALPHA`, `SCALE_MODE`, `MAX_CROP`, `MIN_COVERAGE`, `BLUR_RADIUS`, `BLUR_BRIGHTNESS`, `OVERLAY_MARGIN`, `OVERLAY_LINE_GAP`, `WIDTH`/`HEIGHT`. When installed, re-run `pipx install --force .` after changing them.
 
 ### Clock-aligned rotation
 
@@ -166,14 +166,19 @@ Portrait images are shown in pairs, each one in half of the screen with the same
 
 ### Preloading
 
-Without `--preload-images` (or with `0`) each image is processed when its turn comes, so its file must be readable at that moment; an image that cannot be opened is skipped and the next one is tried.
+Without `--preload-images` (or with `0`) each image is processed when its turn comes, so its file must be readable at that moment; an image that cannot be opened is skipped and the next one is tried:
 
-With `--preload-images N` (`100` when given without a value) a batch of N random images is processed in advance, portraits already paired, and saved fitted to the screen in `$XDG_CACHE_HOME/tspf/preload/`; the slideshow shows the batch from there without reading the source files. This suits images on a network share: a share that goes away does not interrupt the batch being shown.
+- The search stops after `SELECTION_TIMEOUT` (10 s) per change; then the default background is shown and the search goes on at the next change
+- Images that could not be read are tried again every `DROPPED_RETRY` (10 min), also without `--auto-refresh`
+- When none of the images can be read, it is logged once, not at every change
 
-- Once the whole batch has been shown, a new batch is preloaded and the old one is deleted
+With `--preload-images N` (`100` when given without a value, at most `1000`) a batch of N random images is processed in advance, portraits already paired, and saved fitted to the screen in `$XDG_CACHE_HOME/tspf/preload/`; the slideshow shows the batch from there without reading the source files. This suits images on a network share: a share that goes away does not interrupt the batch being shown.
+
+- While a batch is shown, the next one is prepared a few images per change, so it is ready when the current one ends; then it replaces the current batch and the old one is deleted
 - If none of the new batch's images can be read (e.g. the share is not available), the current batch is shown again and a new batch is tried after it
-- The preloaded batch is not counted in `--cache-size`; each processed background takes roughly 0.1-0.5 MB
-- The batch is prepared right after an image change, before the next one; processed images are also kept in the cache, so images already shown before are preloaded faster. If preparing takes longer than `--interval` (many new images on slow hardware), that change is shown at the following change time
+- The first batch is prepared at startup, before the first image is shown
+- The preloaded batch is not counted in `--cache-size`; each processed background takes roughly 0.1-0.5 MB. Backgrounds already in the cache are linked into the batch instead of being written again
+- Processed images are also kept in the cache, so images shown before are preloaded faster
 
 ### Image cache
 
