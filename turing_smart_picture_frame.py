@@ -20,7 +20,8 @@
 #          Without --preload-images, looking for a readable image stops after SELECTION_TIMEOUT (10 s)
 #          per change (the default background is shown and the search goes on at the next change), images
 #          that could not be read are tried again after DROPPED_RETRY (10 min) also without
-#          --auto-refresh, and "none of the images can be read" is logged once instead of every change
+#          --auto-refresh, and "none of the images can be read" is logged once instead of every change.
+#          The version is logged as the first line at startup and shown in --help
 # 1.0.14 - --images can be repeated to show the images of several directories (--images A --images B);
 #          each one must exist and be readable. A directory given twice (same device/inode, e.g. through a
 #          symlink or a bind mount) is used once; with --recursive, a directory inside another --images
@@ -199,8 +200,8 @@ Notes:
   once it has been shown.
 - The log is written to $XDG_CACHE_HOME/tspf/log.log (max 1 MB); with --revision SIMU the simulated
   screen is written to $XDG_CACHE_HOME/tspf/simu/screencap.png. Nothing is written to the current directory.
-- At startup the effective configuration is logged: every option with its value, defaults included,
-  plus the cache directory and log file.
+- At startup the version is logged first, then the effective configuration: every option with its
+  value, defaults included, plus the cache directory and log file. --help also shows the version.
 - The first image is shown at startup; the next ones change at the next multiple of --interval
   from local midnight. Every allowed interval divides a day, so each day starts aligned at 00:00:00.
   Multiples follow the local wall clock, also across daylight saving changes and clock adjustments.
@@ -1724,7 +1725,7 @@ def rotation_interval(value):
 
 def parse_arguments():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Turing Smart Screen Image Slideshow")
+    parser = argparse.ArgumentParser(description=f"Turing Smart Screen Image Slideshow {__version__}")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug output (default: INFO level only)")
     parser.add_argument("--images", action="append", metavar="PATH",
@@ -1830,6 +1831,8 @@ def main():
     SCALE_MODE = args.scale_mode
     MAX_CROP = args.max_crop
     MIN_COVERAGE = args.min_coverage
+
+    log_info(f"turing-smart-picture-frame {__version__}")
 
     # Set verbosity level based on arguments
     if args.debug:
