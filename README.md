@@ -104,7 +104,7 @@ turing-smart-picture-frame --images ~/Pictures --font ~/fonts/MyFont.ttf
 turing-smart-picture-frame --images /path/to/photos --images /path/to/wallpapers --recursive
 ```
 
-Supported formats: PNG, JPG/JPEG, BMP, GIF. Press Ctrl+C to exit.
+Supported formats: PNG, JPG/JPEG, BMP, GIF. Press Ctrl+C to exit; the screen is cleared to black on exit (also on `SIGTERM`, e.g. when stopped as a service).
 
 Defaults are set at the top of `turing_smart_picture_frame.py`: `COM_PORT`, `REVISION`, `IMAGE_ROTATION_INTERVAL`, `AUTO_REFRESH`, `AUTO_REFRESH_DEFAULT`, `PRELOAD_IMAGES`, `PRELOAD_IMAGES_DEFAULT`, `MAX_PRELOAD_IMAGES`, `SELECTION_TIMEOUT`, `DROPPED_RETRY`, `BRIGHTNESS`, `CACHE_DIR`, `CACHE_SIZE_MB`, `TIME_STYLE`/`DATE_STYLE`/`DAY_STYLE` (size, color on dark and on light backgrounds), `TEXT_CONTRAST`, `OUTLINE_WIDTH`, `BOX_ALPHA`, `SCALE_MODE`, `MAX_CROP`, `MIN_COVERAGE`, `BLUR_RADIUS`, `BLUR_BRIGHTNESS`, `OVERLAY_MARGIN`, `OVERLAY_LINE_GAP`, `WIDTH`/`HEIGHT`. When installed, re-run `pipx install --force .` after changing them.
 
