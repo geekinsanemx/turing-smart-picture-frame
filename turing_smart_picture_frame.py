@@ -3,6 +3,25 @@
 # Based on turing-smart-screen-python library
 #
 # Changelog:
+# 1.1.0 - --preload-images N now really preloads: a batch of N random images (all --images directories
+#          together) is processed, portraits already paired, and saved fitted to the screen in its own
+#          directory, PRELOAD_DIR ($XDG_CACHE_HOME/tspf/preload, outside the --cache-size limit); the
+#          slideshow shows the batch from there without reading the source files, so a share that goes
+#          away does not interrupt it. While a batch is shown, the next one is prepared a few images per
+#          change (the first batch, at startup, at once); when the current batch ends it replaces it and
+#          the old one is deleted; if none of the new batch's images can be read (e.g. the share is not
+#          available), the current batch is shown again. Backgrounds already in the cache are linked
+#          into the batch instead of encoded again. A portrait whose pair partner cannot be read is
+#          shown alone; a symlink at PRELOAD_DIR is replaced by a directory, so nothing is written or
+#          deleted outside the cache. --preload-images without a value means 100
+#          (PRELOAD_IMAGES_DEFAULT), at most 1000 (MAX_PRELOAD_IMAGES); not given or 0 processes each
+#          image when its turn comes, as before. The previous random sampling (only N images
+#          classified, re-sampled after all were shown) is replaced by the batches.
+#          Without --preload-images, looking for a readable image stops after SELECTION_TIMEOUT (10 s)
+#          per change (the default background is shown and the search goes on at the next change), images
+#          that could not be read are tried again after DROPPED_RETRY (10 min) also without
+#          --auto-refresh, and "none of the images can be read" is logged once instead of every change.
+#          The version is logged as the first line at startup and shown in --help
 # 1.0.14 - --images can be repeated to show the images of several directories (--images A --images B);
 #          each one must exist and be readable. A directory given twice (same device/inode, e.g. through a
 #          symlink or a bind mount) is used once; with --recursive, a directory inside another --images
@@ -127,8 +146,9 @@ Configuration:
                    or whole hours dividing a day (default: 60)
    --auto-refresh [DURATION]: Rescan the images directories every DURATION, seconds or a number with
                    unit s/m/h/d (e.g. 600, 30m, 2h), from 1s to 365d; default without a value: 1h; omitted = no rescan
-   --preload-images N: Use only N random images of the discovered ones (all directories together),
-                   re-sampled after all of them have been shown (default: 0 = no limit)
+   --preload-images [N]: Process batches of N random images (all directories together, up to 1000) in
+                   advance into $XDG_CACHE_HOME/tspf/preload and show them from there; without a value
+                   100; not given or 0 = process each image when its turn comes (default: 0)
    --revision REV: Display hardware revision: A, B, C, D or SIMU (default: A)
    --port PORT   : Serial port, e.g. /dev/ttyACM0, or AUTO for auto-detection (default: AUTO)
    --brightness N: Display brightness 0-100 (default: 50)
@@ -141,6 +161,9 @@ Configuration:
 
 2. Hardcoded Configuration (modify in code; defaults of the options above):
    - COM_PORT, REVISION, IMAGE_ROTATION_INTERVAL, PRELOAD_IMAGES, BRIGHTNESS, CACHE_SIZE_MB
+   - PRELOAD_IMAGES_DEFAULT (--preload-images without a value), MAX_PRELOAD_IMAGES
+   - SELECTION_TIMEOUT, DROPPED_RETRY: seconds to look for a readable image per change, and before an
+     unreadable image is tried again (without --preload-images)
    - AUTO_REFRESH (None = disabled), AUTO_REFRESH_DEFAULT (--auto-refresh without a value)
    - CACHE_DIR: processed images cache ($XDG_CACHE_HOME/tspf, default ~/.cache/tspf)
    - TIME_STYLE, DATE_STYLE, DAY_STYLE: overlay (font size, color on dark bg, color on light bg)
@@ -171,16 +194,20 @@ Notes:
 - Processed images are cached in $XDG_CACHE_HOME/tspf (default ~/.cache/tspf), named by the hash of
   the source image content; they survive restarts and are shared by identical images in different
   directories. The least recently used files are deleted when the cache exceeds --cache-size MB.
-- An image is processed the first time it is shown; later it is read from the cache.
+- An image is processed the first time it is shown; later it is read from the cache. With
+  --preload-images, a batch is processed in advance into $XDG_CACHE_HOME/tspf/preload (not counted
+  in --cache-size) and shown from there without reading the source files; the next batch replaces it
+  once it has been shown.
 - The log is written to $XDG_CACHE_HOME/tspf/log.log (max 1 MB); with --revision SIMU the simulated
   screen is written to $XDG_CACHE_HOME/tspf/simu/screencap.png. Nothing is written to the current directory.
-- At startup the effective configuration is logged: every option with its value, defaults included,
-  plus the cache directory and log file.
+- At startup the version is logged first, then the effective configuration: every option with its
+  value, defaults included, plus the cache directory and log file. --help also shows the version.
 - The first image is shown at startup; the next ones change at the next multiple of --interval
   from local midnight. Every allowed interval divides a day, so each day starts aligned at 00:00:00.
   Multiples follow the local wall clock, also across daylight saving changes and clock adjustments.
 - --auto-refresh adds new images to the end of the rotation queue and removes deleted ones; with
-  --preload-images new images enter the next random sample. If an images directory or subdirectory
+  --preload-images the next batch is drawn from the updated images (the current batch is shown from
+  the cache until it ends). If an images directory or subdirectory
   cannot be read during a rescan, or the directory's device/inode changed since startup (e.g. an
   unmounted share), its known images are kept while the other directories are rescanned. An image
   that cannot be opened when its turn comes is skipped and the next one is tried.
@@ -196,6 +223,8 @@ import argparse
 import calendar
 import hashlib
 import re
+import shutil
+import tempfile
 from collections import namedtuple
 from functools import partial
 from itertools import chain
@@ -213,7 +242,7 @@ from library.lcd.lcd_comm_rev_d import LcdCommRevD
 from library.lcd.lcd_simulated import LcdSimulated
 from library.log import APP_DIR, LOG_FILE, logger
 
-__version__ = "1.0.14"
+__version__ = "1.1.0"
 
 # Configuration (defaults of the command line options)
 COM_PORT = "AUTO"  # Set your COM port or "AUTO" for auto-discovery
@@ -230,10 +259,15 @@ CLOCK_TOLERANCE = 1.0
 AUTO_REFRESH = None
 AUTO_REFRESH_DEFAULT = 3600
 MAX_AUTO_REFRESH = 365 * SECONDS_PER_DAY
-PRELOAD_IMAGES = 0  # Random sample size of discovered images, 0 = no limit
+PRELOAD_IMAGES = 0  # Images per preloaded batch, 0 = process each image when its turn comes
+PRELOAD_IMAGES_DEFAULT = 100  # --preload-images without a value
+MAX_PRELOAD_IMAGES = 1000     # Largest --preload-images
+SELECTION_TIMEOUT = 10  # Seconds to look for a readable image per change before showing the default background
+DROPPED_RETRY = 600     # Seconds before an image that could not be read is tried again (without --auto-refresh)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif"}
 BRIGHTNESS = 50    # Display brightness 0-100
 CACHE_DIR = APP_DIR
+PRELOAD_DIR = os.path.join(CACHE_DIR, "preload")  # The preloaded batch (--preload-images), not counted in CACHE_SIZE_MB
 CACHE_SIZE_MB = 100  # Max size of CACHE_DIR, least recently used images are deleted first
 CACHE_FORMAT = 1     # Part of every cache key: bump when image processing changes to invalidate old files
 
@@ -397,6 +431,14 @@ class ImageCache:
         if removed:
             log_debug(f"Cache limit: removed {removed} least recently used images, {total / 1048576:.1f} MB left")
 
+def preload_directory():
+    """Make PRELOAD_DIR a real directory inside the cache: a symlink there is removed (not what it points
+    to), so preloaded batches are never written or deleted outside the cache"""
+    if os.path.islink(PRELOAD_DIR):
+        log_warning(f"{PRELOAD_DIR} is a symlink; removing the link and using a directory instead")
+        os.remove(PRELOAD_DIR)
+    os.makedirs(PRELOAD_DIR, exist_ok=True)
+
 def owner(path, directories):
     """The most specific of directories that contains path, or None"""
     return max((directory for directory in directories if path.startswith(os.path.join(directory, ""))),
@@ -501,12 +543,15 @@ class OrientationCache:
 class ImageManager:
     """Handles image loading, resizing, and rotation with orientation detection.
 
-    The rotation state (discovered images, sample, queues, default background) has a single owner: the
+    Two modes: with preload_images 0 every image is processed on demand when its turn comes (rotation
+    queues); with preload_images N, a batch of N random images is processed into PRELOAD_DIR and shown
+    from there, without reading the source files, then replaced by a new batch (see next_from_batch()).
+
+    The rotation state (discovered images, queues, batch, default background) has a single owner: the
     main thread until the rotation thread starts, then only the rotation thread. The refresh thread
-    only calls scan(), which reads configuration, the image_list tuple (replaced, never modified, by
-    the rotation thread) and the thread-safe OrientationCache, and hands the result over with
-    offer_scan(); get_next_image() applies it. No lock guards the queues because no other thread
-    touches them."""
+    only calls scan(), which reads configuration and the thread-safe OrientationCache, and hands the
+    result over with offer_scan(); get_next_image() applies it. No lock guards the rotation state
+    because no other thread touches it."""
 
     def __init__(self, source_identities, cache, recursive_search=False, display_width=320, display_height=480,
                  preload_images=0):
@@ -519,16 +564,25 @@ class ImageManager:
         self.preload_images = preload_images
 
         self.discovered_images = []
-        self.image_list = ()
         self.portrait_images = []
         self.landscape_images = []
-        self.shown_images = set()
-        self.current_index = 0
+        self.batch = []
+        self.batch_position = 0
+        self.pending = None
+        self.next_batch = []
+        self.next_dir = None
+        self.next_failed = 0
+        self.dropped = {}
+        self.queues_warned = False
         self.default_background = None
         self.orientations = OrientationCache(partial(ImageManager.kind_for_size,
                                                      display_width=display_width, display_height=display_height))
         self.pending_lock = Lock()
         self.pending_scan = None
+        if preload_images:
+            if not os.path.islink(PRELOAD_DIR):
+                shutil.rmtree(PRELOAD_DIR, ignore_errors=True)
+            preload_directory()
         self.load_images()
 
     @staticmethod
@@ -579,7 +633,8 @@ class ImageManager:
         else:
             if len(self.source_dirs) > 1:
                 log_info(f"Found {len(self.discovered_images)} images in {len(self.source_dirs)} directories")
-            self.select_sample()
+            if not self.preload_images:
+                self.fill_queues()
 
     def find_images(self, source_dir, onerror=None):
         """Yield supported image files of source_dir (extension matched case-insensitively), skipping
@@ -601,10 +656,10 @@ class ImageManager:
         unreadable, like an unreadable subdirectory (e.g. lost+found at a mount point): apply_scan() keeps
         its known images (see retained()), so a partial scan is not mistaken for deleted images. An image
         that cannot be opened when its turn comes is skipped (see get_next_image()).
-        The images that can rotate (rotation_pool: all
-        discovered, or the current sample from the image_list tuple) are classified here, so the files
-        are opened on the refresh thread; apply_scan() then finds them in the OrientationCache with a
-        single os.stat. The cache is pruned to this scan."""
+        Without --preload-images every discovered image is classified here, so the files are opened on
+        the refresh thread and apply_scan() finds them in the OrientationCache with a single os.stat; with
+        it only the batch candidates are classified, when a batch is preloaded. The cache is pruned to this
+        scan."""
         unreadable = []
         scanned = []
         found = {}
@@ -634,8 +689,11 @@ class ImageManager:
             found.update(dict.fromkeys(images))
         discovered = list(found)
         self.orientations.prune(set(discovered), unreadable, scanned)
-        for image_path in self.rotation_pool(discovered):
-            self.orientations.classify(image_path)
+        if not self.preload_images:
+            for image_path in discovered:
+                if stop_event.is_set():
+                    break
+                self.orientations.classify(image_path)
         return discovered, unreadable, scanned
 
     def offer_scan(self, result):
@@ -659,8 +717,9 @@ class ImageManager:
 
     def apply_scan(self, discovered, unreadable, scanned):
         """Apply a scan() result: deleted images leave the queues, new ones join the end of their queue in
-        random order (with --preload-images they can enter the next sample); the default background is
-        used while no images exist. The new state is computed first and assigned at the end, so a failure
+        random order (with --preload-images the discovered images change and the next batch is drawn from
+        them; the current batch is shown from the cache until it ends); the default background is used
+        while no images exist. The new state is computed first and assigned at the end, so a failure
         leaves the previous state intact and the next rescan retries it. Known images under unreadable
         directories (see retained()) stay discovered."""
         unreadable = set(unreadable)
@@ -675,7 +734,6 @@ class ImageManager:
         if not discovered:
             default_background = self.default_background or self.prepare_default_background()
             self.discovered_images = discovered
-            self.image_list = ()
             self.portrait_images = []
             self.landscape_images = []
             self.default_background = default_background
@@ -685,7 +743,17 @@ class ImageManager:
                 log_debug("Auto refresh: still no images")
             return
 
-        pool = self.rotation_pool(discovered)
+        if self.preload_images:
+            self.discovered_images = discovered
+            self.default_background = None
+            if added or removed:
+                log_info(f"Auto refresh: {len(discovered)} images discovered (+{added}, -{removed}); "
+                         "the next preloaded batch is drawn from them")
+            else:
+                log_debug("Auto refresh: no changes")
+            return
+
+        pool = list(discovered)
         kinds = {image_path: self.orientations.classify(image_path) for image_path in pool}
         portraits = {image_path for image_path, kind in kinds.items() if kind == "portrait"}
         landscapes = {image_path for image_path, kind in kinds.items() if kind == "landscape"}
@@ -701,24 +769,16 @@ class ImageManager:
 
         self.discovered_images = discovered
         self.default_background = None
-        self.image_list = tuple(pool)
         self.portrait_images = portrait_images
         self.landscape_images = landscape_images
-        if self.is_sampled() and not portrait_images and not landscape_images:
-            self.select_sample()
+        queued = set(portrait_images) | set(landscape_images)
+        self.dropped = {p: t for p, t in self.dropped.items() if p in current and p not in queued}
 
         if added or removed:
             log_info(f"Auto refresh: {len(discovered)} images discovered (+{added}, -{removed}), "
                      f"{len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape in rotation")
         else:
             log_debug("Auto refresh: no changes")
-
-    def rotation_pool(self, discovered):
-        """Images eligible for the rotation: all discovered, or the current sample still present"""
-        if self.sampled(len(discovered)):
-            present = set(discovered)
-            return [image_path for image_path in self.image_list if image_path in present]
-        return list(discovered)
 
     @staticmethod
     def balanced(portrait_images, landscape_images, portraits):
@@ -735,48 +795,154 @@ class ImageManager:
             landscape_images.append(portrait_images.pop())
         return portrait_images, landscape_images
 
-    def sampled(self, count):
-        """True when --preload-images limits count discovered images to a random sample"""
-        return 0 < self.preload_images < count
-
-    def is_sampled(self):
-        """True when --preload-images limits the discovered images to a random sample"""
-        return self.sampled(len(self.discovered_images))
-
-    def select_sample(self):
-        """Pick the images to rotate (a random sample of preload_images, or all) and categorize them.
-
-        If none of the new candidates can be used (e.g. they were deleted after the last applied scan)
-        while the current queues still hold images, the current queues are kept."""
-        if self.is_sampled():
-            candidates = random.sample(self.discovered_images, self.preload_images)
-        else:
-            candidates = list(self.discovered_images)
-        kinds = {image_path: self.orientations.classify(image_path) for image_path in candidates}
-        portraits = [p for p in candidates if kinds[p] == "portrait"]
-        landscapes = [p for p in candidates if kinds[p] == "landscape"]
-        if not portraits and not landscapes and (self.portrait_images or self.landscape_images):
-            log_warning("None of the new sample's images can be shown, keeping the current ones")
-            self.shown_images = set()
-            return
-        if self.is_sampled():
-            log_info(f"Selected random sample of {self.preload_images} of {len(self.discovered_images)} images")
+    def classified(self, candidates, deadline=None):
+        """(portraits, landscapes) of candidates, lone portraits balanced and both shuffled, plus the count
+        of images skipped below --min-coverage; unreadable images are left out. Stops at shutdown and at
+        deadline (time.monotonic()), leaving the remaining candidates out."""
+        kinds = {}
+        for image_path in candidates:
+            if stop_event.is_set() or (deadline is not None and time.monotonic() > deadline):
+                break
+            kinds[image_path] = self.orientations.classify(image_path)
+        portraits = [p for p, kind in kinds.items() if kind == "portrait"]
+        landscapes = [p for p, kind in kinds.items() if kind == "landscape"]
         portraits, landscapes = self.balanced(portraits, landscapes, set(portraits))
         random.shuffle(portraits)
         random.shuffle(landscapes)
-        self.image_list = tuple(candidates)
-        self.shown_images = set()
+        return portraits, landscapes, sum(1 for kind in kinds.values() if kind == "skipped")
+
+    def fill_queues(self, deadline=None):
+        """Without --preload-images: put the discovered images in the rotation queues (in random order, as
+        many as can be classified before deadline). When none can be used, a warning is logged once until
+        some can be used again."""
+        portraits, landscapes, skipped = self.classified(
+            random.sample(self.discovered_images, len(self.discovered_images)), deadline)
         self.portrait_images = portraits
         self.landscape_images = landscapes
-        skipped = sum(1 for p in candidates if kinds[p] == "skipped")
+        self.dropped = {}
+        if not portraits and not landscapes:
+            if not self.queues_warned:
+                self.queues_warned = True
+                log_warning("None of the discovered images can be read now; trying again at the next change")
+            return
+        self.queues_warned = False
         log_info(f"Categorized images: {len(self.portrait_images)} portrait, {len(self.landscape_images)} landscape"
                  + (f", {skipped} skipped (below --min-coverage {MIN_COVERAGE}%)" if skipped else ""))
 
-    def sample_exhausted(self):
-        """True when every image of the current random sample has been shown"""
-        if not self.is_sampled():
+    def retry_dropped(self, deadline):
+        """Without --preload-images: images dropped as unreadable more than DROPPED_RETRY seconds ago are
+        classified again and rejoin the end of their queue if they can be read (e.g. their share is back)"""
+        now = time.monotonic()
+        due = [image_path for image_path, dropped_at in self.dropped.items() if now - dropped_at >= DROPPED_RETRY]
+        if not due:
+            return
+        present = set(self.discovered_images)
+        for image_path in due:
+            del self.dropped[image_path]
+            self.orientations.forget(image_path)
+        portraits, landscapes, _ = self.classified([p for p in due if p in present], deadline)
+        for image_path in set(due) - set(portraits) - set(landscapes):
+            if image_path in present:
+                self.dropped[image_path] = now
+        if portraits or landscapes:
+            log_debug(f"{len(portraits) + len(landscapes)} images that could not be read are back in the rotation")
+            self.portrait_images, self.landscape_images = self.balanced(
+                self.portrait_images + portraits, self.landscape_images + landscapes,
+                set(self.portrait_images) | set(portraits))
+
+    def start_next_batch(self):
+        """With --preload-images: choose preload_images random discovered images for the next batch, pair
+        the portraits and create its directory under PRELOAD_DIR; the selections are processed by
+        advance_next_batch(). Returns False if the directory cannot be created."""
+        candidates = random.sample(self.discovered_images, min(self.preload_images, len(self.discovered_images)))
+        log_info(f"Preloading {len(candidates)} of {len(self.discovered_images)} images")
+        portraits, landscapes, _ = self.classified(candidates)
+        selections = [(p1, p2) for p1, p2 in zip(portraits[0::2], portraits[1::2])]
+        selections += [(p,) for p in landscapes]
+        if len(portraits) % 2:
+            selections.append((portraits[-1],))
+        random.shuffle(selections)
+        try:
+            preload_directory()
+            self.next_dir = tempfile.mkdtemp(dir=PRELOAD_DIR)
+        except OSError as e:
+            log_error(f"Cannot create the preloaded batch in {PRELOAD_DIR} ({e})")
             return False
-        return self.shown_images.issuperset(self.portrait_images + self.landscape_images)
+        self.pending = selections
+        self.next_batch = []
+        self.next_failed = len(candidates) - len(portraits) - len(landscapes)
+        return True
+
+    def advance_next_batch(self, count):
+        """Process up to count pending selections of the next batch into its directory. A background
+        already in the cache is linked (or copied) instead of encoded again; a pair that cannot be
+        processed is tried as two single portraits."""
+        while self.pending and count > 0 and not stop_event.is_set():
+            selection = self.pending.pop(0)
+            count -= 1
+            if len(selection) == 2:
+                backgrounds = [self.resize_portrait_pair(*selection)]
+                if backgrounds[0] is None:
+                    backgrounds = [self.resize_landscape_single(image_path) for image_path in selection]
+            else:
+                backgrounds = [self.resize_landscape_single(selection[0])]
+            for background in backgrounds:
+                if background is None:
+                    continue
+                path = os.path.join(self.next_dir, f"{len(self.next_batch):04d}.png")
+                try:
+                    try:
+                        os.link(background.path, path)
+                    except OSError:
+                        background.frame.save(path, format="PNG")
+                except OSError as e:
+                    log_error(f"Cannot write the preloaded batch to {PRELOAD_DIR} ({e})")
+                    self.pending = []
+                    return
+                self.next_batch.append(path)
+
+    def finish_next_batch(self):
+        """Finish the next batch and make it the current one (the old batch's directory is deleted); if
+        none of its images could be prepared (e.g. the share is not available), the current batch is kept"""
+        self.advance_next_batch(len(self.pending))
+        log_info(f"Preloaded {len(self.next_batch)} backgrounds"
+                 + (f" ({self.next_failed} images could not be used)" if self.next_failed else ""))
+        if self.next_batch:
+            if self.batch:
+                shutil.rmtree(os.path.dirname(self.batch[0]), ignore_errors=True)
+            self.batch = self.next_batch
+            log_info(f"Showing a new preloaded batch of {len(self.batch)} backgrounds")
+        else:
+            shutil.rmtree(self.next_dir, ignore_errors=True)
+            if self.batch:
+                log_warning("None of the images of the new batch could be prepared; showing the current batch again")
+        self.pending = None
+        self.next_batch = []
+        self.next_dir = None
+
+    def next_from_batch(self):
+        """Rotation thread, with --preload-images: the next background of the current batch, read from
+        PRELOAD_DIR. While a batch is shown, the next one is prepared a few images per change, so it is
+        ready when the current one ends (the first batch, at startup, is prepared at once); then it
+        replaces the current batch. Returns None if no batch is available."""
+        if self.discovered_images and self.pending is None:
+            self.start_next_batch()
+        if self.batch_position >= len(self.batch):
+            if self.pending is not None:
+                self.finish_next_batch()
+            self.batch_position = 0
+        elif self.pending:
+            left = len(self.batch) - self.batch_position
+            self.advance_next_batch(math.ceil(len(self.pending) / left))
+        while self.batch_position < len(self.batch):
+            path = self.batch[self.batch_position]
+            self.batch_position += 1
+            try:
+                with Image.open(path) as img:
+                    return Background(path, img.convert("RGB"))
+            except OSError as e:
+                log_debug(f"Preloaded background unavailable: {path}: {e}")
+        return None
 
     @classmethod
     def kind_for_size(cls, width, height, display_width, display_height):
@@ -974,21 +1140,34 @@ class ImageManager:
         return canvas
 
     def get_next_image(self):
-        """Next background to show: applies the latest queued rescan, replaces an exhausted
-        --preload-images sample, selects the next images and processes them. Images that fail to
-        process (missing, unreadable, or on a share that is not available) are dropped if unreadable and
-        the next ones are tried, through the whole rotation if needed, so a change is not skipped."""
+        """Next background to show: applies the latest queued rescan, then with --preload-images takes the
+        next background of the preloaded batch (see next_from_batch(); the default background while no
+        batch could be prepared), and otherwise selects the next images and processes them. Images that
+        fail to process (missing, unreadable, or on a share that is not available) are dropped if
+        unreadable and the next ones are tried, through the whole rotation if needed, so a change is not
+        skipped."""
         self.apply_pending_scans()
+        if self.preload_images:
+            background = self.next_from_batch()
+            if background is not None:
+                return background
+            if self.default_background is None:
+                self.default_background = self.prepare_default_background()
+            return self.default_background
         if self.default_background is not None and not self.discovered_images:
             return self.default_background
-        if self.sample_exhausted():
-            log_info("All images of the current sample have been shown, selecting a new sample")
-            self.select_sample()
+        deadline = time.monotonic() + SELECTION_TIMEOUT
         if not self.portrait_images and not self.landscape_images and self.discovered_images:
             log_debug("No images left in the rotation queues, trying the discovered images again")
-            self.select_sample()
+            self.fill_queues(deadline)
+        elif self.dropped:
+            self.retry_dropped(deadline)
         for _ in range(len(self.portrait_images) + len(self.landscape_images)):
             if stop_event.is_set():
+                break
+            if time.monotonic() > deadline:
+                log_warning(f"No readable image found within {SELECTION_TIMEOUT} s; showing the default "
+                            "background and trying the next images at the next change")
                 break
             selection = self.select_next()
             if not selection:
@@ -1018,8 +1197,8 @@ class ImageManager:
     def drop_unreadable(self, selection):
         """After selection failed to process: classify its images again from the files and fully decode
         them, removing the ones that fail from the queues (e.g. permissions revoked without changing mtime
-        or size, or a truncated file whose header still parses); a later rescan adds them back once they
-        can be read"""
+        or size, or a truncated file whose header still parses); they are tried again after DROPPED_RETRY
+        seconds (see retry_dropped()), or added back by a later rescan once they can be read"""
         kinds = {}
         for image_path in selection:
             self.orientations.forget(image_path)
@@ -1028,6 +1207,8 @@ class ImageManager:
                 self.orientations.reject(image_path)
                 kind = "error"
             kinds[image_path] = kind
+            if kind == "error":
+                self.dropped[image_path] = time.monotonic()
         portraits = [p for p in self.portrait_images if p not in kinds]
         landscapes = [p for p in self.landscape_images if p not in kinds]
         portraits.extend(p for p, kind in kinds.items() if kind == "portrait")
@@ -1070,7 +1251,6 @@ class ImageManager:
             log_debug("Only single portrait images left, treating as landscape")
             img = self.portrait_images.pop(0)
             self.portrait_images.append(img)
-            self.shown_images.add(img)
             return (img,)
 
         return None
@@ -1083,7 +1263,6 @@ class ImageManager:
 
         # Add them back to the end for rotation
         self.portrait_images.extend([img1, img2])
-        self.shown_images.update([img1, img2])
 
         return img1, img2
 
@@ -1094,7 +1273,6 @@ class ImageManager:
 
         # Add it back to the end for rotation
         self.landscape_images.append(img)
-        self.shown_images.add(img)
 
         return (img,)
 
@@ -1547,7 +1725,7 @@ def rotation_interval(value):
 
 def parse_arguments():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Turing Smart Screen Image Slideshow")
+    parser = argparse.ArgumentParser(description=f"Turing Smart Screen Image Slideshow {__version__}")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug output (default: INFO level only)")
     parser.add_argument("--images", action="append", metavar="PATH",
@@ -1574,10 +1752,13 @@ def parse_arguments():
                             f"2h, 1d), up to {format_duration(MAX_AUTO_REFRESH)}; without a value every "
                             f"{format_duration(AUTO_REFRESH_DEFAULT)} "
                             "(default: no rescan)")
-    parser.add_argument("--preload-images", type=int_range(0), default=PRELOAD_IMAGES, metavar="N",
-                       help="Use only N random images of the discovered ones (of all --images directories "
-                            "together), re-sampled after all of them have been shown; 0 = no limit "
-                            f"(default: {PRELOAD_IMAGES})")
+    parser.add_argument("--preload-images", type=int_range(0, MAX_PRELOAD_IMAGES), nargs="?",
+                       const=PRELOAD_IMAGES_DEFAULT, default=PRELOAD_IMAGES, metavar="N",
+                       help="Process batches of N random images (of all --images directories together, up to "
+                            f"{MAX_PRELOAD_IMAGES}) in advance into {PRELOAD_DIR} and show them from there, "
+                            "without reading the source files; the next batch is prepared a few images per "
+                            f"change while one is shown. Without a value {PRELOAD_IMAGES_DEFAULT}; 0 = process "
+                            f"each image when its turn comes (default: {PRELOAD_IMAGES})")
     parser.add_argument("--revision", type=str.upper, choices=REVISIONS, default=REVISION,
                        help=f"Display hardware revision (default: {REVISION})")
     parser.add_argument("--port", default=COM_PORT,
@@ -1651,6 +1832,8 @@ def main():
     MAX_CROP = args.max_crop
     MIN_COVERAGE = args.min_coverage
 
+    log_info(f"turing-smart-picture-frame {__version__}")
+
     # Set verbosity level based on arguments
     if args.debug:
         VERBOSE_LEVEL = "DEBUG"
@@ -1682,11 +1865,10 @@ def main():
                                    display_width=lcd_comm.get_width(),
                                    display_height=lcd_comm.get_height(),
                                    preload_images=args.preload_images)
-
         # Get initial background
         current_background = image_manager.get_next_image()
-        log_info(f"Total images: {len(image_manager.image_list)} in rotation, "
-                 f"{len(image_manager.discovered_images)} discovered")
+        log_info(f"Total images: {len(image_manager.discovered_images)} discovered"
+                 + (f", preloaded in batches of {args.preload_images}" if args.preload_images else ""))
 
         # Start background rotation thread
         bg_thread = Thread(target=background_rotation_thread,
