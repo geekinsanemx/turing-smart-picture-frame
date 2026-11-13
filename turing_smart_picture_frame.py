@@ -3,6 +3,7 @@
 # Based on turing-smart-screen-python library
 #
 # Changelog:
+# 1.1.1 - The screen is cleared (filled with black) on exit: Ctrl+C, SIGTERM, SIGQUIT or a fatal error
 # 1.1.0 - --preload-images N now really preloads: a batch of N random images (all --images directories
 #          together) is processed, portraits already paired, and saved fitted to the screen in its own
 #          directory, PRELOAD_DIR ($XDG_CACHE_HOME/tspf/preload, outside the --cache-size limit); the
@@ -200,6 +201,7 @@ Notes:
   once it has been shown.
 - The log is written to $XDG_CACHE_HOME/tspf/log.log (max 1 MB); with --revision SIMU the simulated
   screen is written to $XDG_CACHE_HOME/tspf/simu/screencap.png. Nothing is written to the current directory.
+- On exit (Ctrl+C, SIGTERM, SIGQUIT) the screen is cleared to black before the connection is closed.
 - At startup the version is logged first, then the effective configuration: every option with its
   value, defaults included, plus the cache directory and log file. --help also shows the version.
 - The first image is shown at startup; the next ones change at the next multiple of --interval
@@ -242,7 +244,7 @@ from library.lcd.lcd_comm_rev_d import LcdCommRevD
 from library.lcd.lcd_simulated import LcdSimulated
 from library.log import APP_DIR, LOG_FILE, logger
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # Configuration (defaults of the command line options)
 COM_PORT = "AUTO"  # Set your COM port or "AUTO" for auto-discovery
@@ -1307,6 +1309,15 @@ def initialize_display():
     lcd_comm.SetBackplateLedColor(led_color=(255, 255, 255))
     lcd_comm.SetOrientation(orientation=Orientation.LANDSCAPE)
 
+def clear_display():
+    """Main thread, on exit: fill the screen with black, the same way on every hardware revision (the
+    library's Clear() paints white or does nothing depending on the revision)"""
+    try:
+        lcd_comm.DisplayPILImage(Image.new("RGB", (lcd_comm.get_width(), lcd_comm.get_height()), (0, 0, 0)))
+        log_info("Screen cleared")
+    except Exception as e:
+        log_warning(f"Cannot clear the screen ({e})")
+
 def relative_luminance(color):
     """WCAG 2.x relative luminance of an sRGB color (0-255 channels)"""
     channels = [value / 255 for value in color[:3]]
@@ -1908,6 +1919,7 @@ def main():
     finally:
         # Clean shutdown
         if lcd_comm:
+            clear_display()
             try:
                 lcd_comm.closeSerial()
                 log_info("LCD connection closed")
