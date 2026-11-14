@@ -10,7 +10,7 @@ The display communication code in `library/` comes from [turing-smart-screen-pyt
 - Random rotation every `--interval` (default 60 seconds; `5m`, `1h`, ... also accepted), aligned to the clock (see [Clock-aligned rotation](#clock-aligned-rotation))
 - Images from one or more directories (`--images`, repeatable)
 - Optional periodic rescan of the images directories (`--auto-refresh`)
-- Optional preloading of image batches, shown without reading the source files (`--preload-images`)
+- Optional fast start with large collections: the slideshow starts with the first images found while the rest are scanned in the background (`--preload-images`)
 - Time (refreshed every second), date and day of week overlay in the bottom right corner
 - Optional recursive search of the images directories
 - Gradient default background when no images are found
@@ -71,7 +71,7 @@ turing-smart-picture-frame [--images PATH [--images PATH ...]] [--recursive] [--
 |---|---|
 | `--images PATH` | Images directory; it must exist and be readable, otherwise the program exits with an error. Repeat it to show the images of several directories: `--images DIR1 --images DIR2`. A directory given twice (also through a symlink or a bind mount) is used once; with `--recursive`, a directory inside another `--images` directory (compared by real path, not inside a hidden directory) is ignored, since the recursive search already reads it; the same file under different paths (symlink, hardlink) is shown once per path (default: `images` in the current directory) |
 | `--recursive` | Search images in subdirectories |
-| `--preload-images [N]` | Process batches of N random images (of all `--images` directories together) in advance into `$XDG_CACHE_HOME/tspf/preload/` and show them from there, without reading the source files; without a value `100`, at most `1000`. Not given or `0`: each image is processed when its turn comes (default: `0`, see [Preloading](#preloading)) |
+| `--preload-images [N]` | Start showing images, in random order, as soon as the first N are found, while the rest are scanned in the background; then all of them rotate. Without a value `100`, at most `1000`. Not given or `0`: every image is scanned and classified before the first one is shown (default: `0`, see [Preloading](#preloading)) |
 | `--interval DURATION` | Time between image changes, at its multiples counted from local midnight: seconds or a number with unit `s`/`m`/`h`/`d` (`30`, `5m`, `1h`, `1d`); only round clock intervals from 5 s to 1 day are accepted (default: `60`, see [Clock-aligned rotation](#clock-aligned-rotation)) |
 | `--auto-refresh [DURATION]` | Rescan the images directories for new or deleted images every DURATION, without interrupting the slideshow: seconds or a number with unit `s`/`m`/`h`/`d` (`600`, `30m`, `2h`, `1d`), up to `365d`; without a value every `1h` (default: no rescan, see [Auto refresh](#auto-refresh)) |
 | `--font NAME\|PATH` | Font for the time/date overlay: a bundled font name (see [Fonts](#fonts), case-insensitive) or the path to a custom `.ttf`/`.otf` file (default: `dejavu`) |
@@ -104,7 +104,9 @@ turing-smart-picture-frame --images ~/Pictures --font ~/fonts/MyFont.ttf
 turing-smart-picture-frame --images /path/to/photos --images /path/to/wallpapers --recursive
 ```
 
-Supported formats: PNG, JPG/JPEG, BMP, GIF. Press Ctrl+C to exit; the screen is cleared to black on exit (also on `SIGTERM`, e.g. when stopped as a service).
+Supported formats: PNG, JPG/JPEG, BMP, GIF. Press Ctrl+C to exit. On exit (also on `SIGTERM`, e.g. when stopped as a service) a revision `A` display is reset, so it shows its own startup screen, and released; the other revisions are cleared to black.
+
+At startup a revision `A` display is reset. The official Turing Smart Screen 3.5" (USB serial number `USB35INCHIPSV2`) is used again as soon as it is back on the USB bus (usually under 2 seconds, at most 10; with `--port AUTO` its port is detected again, since it may change), and the model query it never answers is not sent to it. Other revision `A` displays wait 5 seconds after the reset and are queried for their model, as before.
 
 Defaults are set at the top of `turing_smart_picture_frame.py`: `COM_PORT`, `REVISION`, `IMAGE_ROTATION_INTERVAL`, `AUTO_REFRESH`, `AUTO_REFRESH_DEFAULT`, `PRELOAD_IMAGES`, `PRELOAD_IMAGES_DEFAULT`, `MAX_PRELOAD_IMAGES`, `SELECTION_TIMEOUT`, `DROPPED_RETRY`, `BRIGHTNESS`, `CACHE_DIR`, `CACHE_SIZE_MB`, `TIME_STYLE`/`DATE_STYLE`/`DAY_STYLE` (size, color on dark and on light backgrounds), `TEXT_CONTRAST`, `OUTLINE_WIDTH`, `BOX_ALPHA`, `SCALE_MODE`, `MAX_CROP`, `MIN_COVERAGE`, `BLUR_RADIUS`, `BLUR_BRIGHTNESS`, `OVERLAY_MARGIN`, `OVERLAY_LINE_GAP`, `WIDTH`/`HEIGHT`. When installed, re-run `pipx install --force .` after changing them.
 
@@ -141,7 +143,6 @@ Changes follow the local wall clock: across daylight saving changes the multiple
 `--auto-refresh [DURATION]` rescans the images directories every DURATION (every hour when given without a value) in a separate thread; the clock and the rotation keep running during the scan. DURATION uses the same syntax as `--interval` (`600`, `30m`, `2h`, `1d`), with values from 1 second to 365 days accepted; rescans are not aligned to the clock.
 
 - New images are added to the end of the rotation queue; deleted images are removed from it
-- With `--preload-images`, the next batch is drawn from the updated images; the current batch is shown from the cache until it ends
 - Only new or modified files are opened; the orientation of known images is remembered
 - If no images can be displayed (empty source, unsupported coverage or unreadable files), the default background is shown until usable images become available
 - On every rescan each `--images` directory is checked against the device/inode it had at startup. If it cannot be read or its device/inode changed (for example after unmounting a share), the images already known in it are kept while the other `--images` directories are rescanned. A directory remounted with a different device/inode is not rescanned until the program is restarted
@@ -166,19 +167,24 @@ Portrait images are shown in pairs, each one in half of the screen with the same
 
 ### Preloading
 
-Without `--preload-images` (or with `0`) each image is processed when its turn comes, so its file must be readable at that moment; an image that cannot be opened is skipped and the next one is tried:
+To know whether an image is portrait or landscape, its header has to be read. Without `--preload-images` (or with `0`) every image is scanned and classified at startup, before the first one is shown; with thousands of images, or images on a slow share, this can take a while.
+
+With `--preload-images N` (`100` when given without a value, at most `1000`) the slideshow starts sooner:
+
+- The scan stops at the first N images found; only those are classified and the first one is shown right away
+- They are shown in random order, like the full rotation; the first N found usually come from the first subdirectories, since directories are read in alphabetical order
+- The full scan and classification run in a separate thread while images are being shown, also without `--auto-refresh`
+- When the full scan ends, the rotation is rebuilt from all the images, each one once: the ones not shown yet in random order, followed by the ones already shown
+- With `--auto-refresh`, the following rescans happen every `--auto-refresh` as usual
+- If fewer than N images exist, the scan is already complete and nothing runs in the background
+
+In both modes each image is processed when its turn comes, so its file must be readable at that moment; an image that cannot be opened is skipped and the next one is tried:
 
 - The search stops after `SELECTION_TIMEOUT` (10 s) per change; then the default background is shown and the search goes on at the next change
 - Images that could not be read are tried again every `DROPPED_RETRY` (10 min), also without `--auto-refresh`
 - When none of the images can be read, it is logged once, not at every change
 
-With `--preload-images N` (`100` when given without a value, at most `1000`) a batch of N random images is processed in advance, portraits already paired, and saved fitted to the screen in `$XDG_CACHE_HOME/tspf/preload/`; the slideshow shows the batch from there without reading the source files. This suits images on a network share: a share that goes away does not interrupt the batch being shown.
-
-- While a batch is shown, the next one is prepared a few images per change, so it is ready when the current one ends; then it replaces the current batch and the old one is deleted
-- If none of the new batch's images can be read (e.g. the share is not available), the current batch is shown again and a new batch is tried after it
-- The first batch is prepared at startup, before the first image is shown
-- The preloaded batch is not counted in `--cache-size`; each processed background takes roughly 0.1-0.5 MB. Backgrounds already in the cache are linked into the batch instead of being written again
-- Processed images are also kept in the cache, so images shown before are preloaded faster
+Versions 1.1.0 and 1.1.1 kept preprocessed batches in `$XDG_CACHE_HOME/tspf/preload/`; that directory is deleted at startup.
 
 ### Image cache
 
@@ -188,9 +194,9 @@ Each image is resized/cropped for the screen the first time it is shown and stor
 - identical images in different directories (or with different names) share one cache file
 - an edited image gets a new hash and is processed again
 
-When the cache exceeds `--cache-size` MB, the least recently used files are deleted (the preloaded batch is kept apart, see [Preloading](#preloading)). The cache can also be removed manually at any time.
+When the cache exceeds `--cache-size` MB, the least recently used files are deleted. The cache can also be removed manually at any time.
 
-Nothing is written to the current directory or to the images directories. Other runtime files are also kept in `$XDG_CACHE_HOME/tspf/` (default `~/.cache/tspf/`): `log.log` (max 1 MB), with `--preload-images` the `preload/` subdirectory (the current batch), and with `--revision SIMU` the `simu/` subdirectory (`screencap.png`, `tmp`). The cache size limit only counts processed images, so these files are never deleted by it.
+Nothing is written to the current directory or to the images directories. Other runtime files are also kept in `$XDG_CACHE_HOME/tspf/` (default `~/.cache/tspf/`): `log.log` (max 1 MB) and, with `--revision SIMU`, the `simu/` subdirectory (`screencap.png`, `tmp`). The cache size limit only counts processed images, so these files are never deleted by it.
 
 ## Fonts
 
