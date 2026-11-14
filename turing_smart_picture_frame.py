@@ -5,15 +5,18 @@
 # Changelog:
 # 1.1.3 - Faster display startup on the official Turing 3.5" (revision A, USB serial number USB35INCHIPSV2):
 #          the reset no longer waits a fixed 5 s, the port is opened again as soon as the display is back
-#          on the USB bus (detected again with --port AUTO, since it may change; up to 10 s, the rest of
-#          the 5 s if the display does not disconnect), and the HELLO command it never answers (1 s read
-#          timeout) is skipped. Other revision A displays keep the 5 s wait and HELLO. Ports given as a
-#          symlink (/dev/serial/by-id/...) are recognized. On exit, revision A is reset (it shows its
-#          startup screen) and its port released instead of being filled with black; other revisions are
-#          still filled with black; nothing is sent when the port is not open. Without --auto-refresh, the
-#          full scan after a --preload-images start is tried again if it fails (every DROPPED_RETRY, or at
-#          the next change if it cannot be applied). With several --images directories, the next one is not
-#          scanned at startup once --preload-images images were found
+#          on the USB bus (detected again with --port AUTO, since it may change; up to 10 s from the reset
+#          in total, the rest of the 5 s if the display does not disconnect), and the HELLO command it never
+#          answers (1 s read timeout) is skipped. Other revision A displays keep the 5 s wait and HELLO.
+#          Ports given as a symlink (/dev/serial/by-id/...) are recognized. At startup a revision A port
+#          that is not available yet (e.g. the display is still restarting after the previous run) is
+#          waited for up to 10 s instead of exiting at once. Ctrl+C or SIGTERM stops these waits at once.
+#          On exit, revision A is reset (it shows its startup screen) and its port released instead of
+#          being filled with black; other revisions are still filled with black; nothing is sent when the
+#          port is not open. Without --auto-refresh, the full scan after a --preload-images start is tried
+#          again every DROPPED_RETRY if it fails or cannot be applied. With several --images directories,
+#          the next one is not scanned at startup once --preload-images images were found; the startup
+#          scan stops at the Nth image without looking for more
 # 1.1.2 - --preload-images N means a fast start: the scan stops at the first N images found, they are
 #          classified and shown in random order (each one processed when its turn comes, as without
 #          --preload-images), while the full scan and classification run in a separate thread. When it
@@ -21,7 +24,7 @@
 #          order, the ones already shown at the end, each image once. The full scan runs also without
 #          --auto-refresh; with it, rescans follow every --auto-refresh. The preloaded batches of 1.1.0
 #          (PRELOAD_DIR) are removed, and a preload/ directory left by them is deleted at startup.
-#          Without --preload-images every image is still scanned and classified before the first one
+#          Without --preload-images every image is still scanned and classified before the first one is shown
 # 1.1.1 - The screen is cleared (filled with black) on exit: Ctrl+C, SIGTERM, SIGQUIT or a fatal error
 # 1.1.0 - --preload-images N now really preloads: a batch of N random images (all --images directories
 #          together) is processed, portraits already paired, and saved fitted to the screen in its own
@@ -593,7 +596,8 @@ class ImageManager:
         self.portrait_images = []
         self.landscape_images = []
         self.partial = False
-        self.shown = []
+        self.shown = {}
+        self.failed_scan = None
         self.dropped = {}
         self.queues_warned = False
         self.default_background = None
@@ -644,7 +648,7 @@ class ImageManager:
             if self.preload_images:
                 remaining = self.preload_images - len(discovered)
                 images = list(islice(found, remaining))
-                self.partial = len(images) == remaining and next(found, None) is not None
+                self.partial = len(images) == remaining
                 found.close()
             else:
                 images = list(found)
@@ -738,20 +742,21 @@ class ImageManager:
         """Apply the scan result handed over by the refresh thread, if any. If applying it fails (e.g. the
         default background cannot be written to the cache), the current state is kept and the next
         rescan offers the change again; the rotation continues with the current images. The full scan
-        after a partial start is kept pending and tried again at the next change, unless a newer scan
-        replaced it, since without --auto-refresh no other scan follows."""
+        after a partial start is kept and tried again after DROPPED_RETRY seconds, unless a newer scan
+        arrives first, since without --auto-refresh no other scan follows."""
         with self.pending_lock:
             result, self.pending_scan = self.pending_scan, None
+        if result is None and self.failed_scan and time.monotonic() - self.failed_scan[1] >= DROPPED_RETRY:
+            result = self.failed_scan[0]
         if result is None:
             return
+        self.failed_scan = None
         try:
             self.apply_scan(*result)
         except Exception as e:
             log_error(f"Auto refresh: cannot apply the rescan ({e}), keeping the current images")
             if self.partial:
-                with self.pending_lock:
-                    if self.pending_scan is None:
-                        self.pending_scan = result
+                self.failed_scan = (result, time.monotonic())
 
     def apply_scan(self, discovered, unreadable, scanned):
         """Apply a scan() result: deleted images leave the queues, new ones join the end of their queue in
@@ -777,7 +782,7 @@ class ImageManager:
             self.landscape_images = []
             self.default_background = default_background
             self.partial = False
-            self.shown = []
+            self.shown = {}
             if previous:
                 log_warning(f"Auto refresh: no images left in {', '.join(self.source_dirs)}")
             else:
@@ -790,7 +795,7 @@ class ImageManager:
         landscapes = {image_path for image_path, kind in kinds.items() if kind == "landscape"}
         partial = self.partial
         if partial:
-            shown = list(dict.fromkeys(self.shown))
+            shown = list(self.shown)
             kept_portraits = [p for p in shown if p in portraits]
             kept_landscapes = [p for p in shown if p in landscapes]
         else:
@@ -812,7 +817,7 @@ class ImageManager:
         self.portrait_images = portrait_images
         self.landscape_images = landscape_images
         self.partial = False
-        self.shown = []
+        self.shown = {}
         queued = set(portrait_images) | set(landscape_images)
         self.dropped = {p: t for p, t in self.dropped.items() if p in current and p not in queued}
 
@@ -1122,7 +1127,7 @@ class ImageManager:
                 background = self.resize_landscape_single(selection[0])
             if background is not None:
                 if self.partial:
-                    self.shown.extend(selection)
+                    self.shown.update(dict.fromkeys(selection))
                 return background
             self.drop_unreadable(selection)
         if self.default_background is None:
@@ -1229,7 +1234,7 @@ def initialize_display():
     # Build LcdComm object based on hardware revision
     if REVISION == "A":
         log_info("Selected Hardware Revision A (Turing Smart Screen 3.5\" & UsbPCMonitor 3.5\"/5\")")
-        lcd_comm = LcdCommRevA(com_port=COM_PORT, display_width=WIDTH, display_height=HEIGHT)
+        lcd_comm = LcdCommRevA(com_port=COM_PORT, display_width=WIDTH, display_height=HEIGHT, stop_event=stop_event)
     elif REVISION == "B":
         log_info("Selected Hardware Revision B (XuanFang screen 3.5\" version B / flagship)")
         lcd_comm = LcdCommRevB(com_port=COM_PORT, display_width=WIDTH, display_height=HEIGHT)
@@ -1874,6 +1879,9 @@ def main():
             wake_event.wait(1 - time.time() % 1)
 
         log_info("Image slideshow stopped")
+
+    except InterruptedError as e:
+        log_info(f"Image slideshow stopped: {e}")
 
     except Exception as e:
         log_error(f"Fatal error: {e}")
