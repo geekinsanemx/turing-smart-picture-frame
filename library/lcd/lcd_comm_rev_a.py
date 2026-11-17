@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import os
 import time
 from enum import Enum
 from typing import Optional
@@ -51,13 +52,32 @@ class SubRevision(Enum):
     USBMONITOR_5 = bytearray([0x02, 0x02, 0x02, 0x02, 0x02, 0x02])
     USBMONITOR_7 = bytearray([0x03, 0x03, 0x03, 0x03, 0x03, 0x03])
 
+
+TURING_3_5_SERIAL_NUMBER = "USB35INCHIPSV2"
+RESET_WAIT = 5
+RESET_DISCONNECT_TIMEOUT = 2
+PORT_TIMEOUT = 10
+POLL_INTERVAL = 0.05
+
 # This class is for Turing Smart Screen (rev. A) 3.5" and UsbMonitor screens (all sizes)
 class LcdCommRevA(LcdComm):
+    """Revision A display.
+
+    The official Turing 3.5" is known by its USB serial number (TURING_3_5_SERIAL_NUMBER) and never
+    answers HELLO. Opening the port waits up to PORT_TIMEOUT seconds for it to be available (e.g. a
+    display still re-joining the USB bus after a reset). After RESET, the official Turing 3.5" is waited
+    for to leave the bus (RESET_DISCONNECT_TIMEOUT) and opened again as soon as it is back, within
+    PORT_TIMEOUT seconds of the RESET in total; other displays wait RESET_WAIT seconds as before. Waits
+    poll every POLL_INTERVAL seconds and raise InterruptedError as soon as stop_event is set."""
+
     def __init__(self, com_port: str = "AUTO", display_width: int = 320, display_height: int = 480,
-                 update_queue: Optional[queue.Queue] = None):
+                 update_queue: Optional[queue.Queue] = None, stop_event: Optional[threading.Event] = None):
         logger.debug("HW revision: A")
         LcdComm.__init__(self, com_port, display_width, display_height, update_queue)
-        self.openSerial()
+        self.auto_com_port = com_port == "AUTO"
+        self.stop_event = stop_event
+        self._open_when_available(com_port, time.monotonic() + PORT_TIMEOUT)
+        logger.debug(f"COM port: {self.com_port}")
 
     def __del__(self):
         self.closeSerial()
@@ -67,7 +87,7 @@ class LcdCommRevA(LcdComm):
         com_ports = comports()
 
         for com_port in com_ports:
-            if com_port.serial_number == "USB35INCHIPSV2":
+            if com_port.serial_number == TURING_3_5_SERIAL_NUMBER:
                 return com_port.device
             if com_port.vid == 0x1a86 and com_port.pid == 0x5722:
                 return com_port.device
@@ -112,23 +132,83 @@ class LcdCommRevA(LcdComm):
             self.display_width = 600
             self.display_height = 1024
         else:
-            self.sub_revision = SubRevision.TURING_3_5
-            self.display_width = 320
-            self.display_height = 480
+            self._set_turing_3_5()
 
         logger.debug("HW sub-revision: %s" % (str(self.sub_revision)))
 
-    def InitializeComm(self):
-        self._hello()
+    def _set_turing_3_5(self):
+        self.sub_revision = SubRevision.TURING_3_5
+        self.display_width = 320
+        self.display_height = 480
 
-    def Reset(self):
-        logger.info("Display reset (COM port may change)...")
+    @staticmethod
+    def _listed_port(device: str):
+        """The comports() entry of device (symlinks such as /dev/serial/by-id resolved), or None"""
+        target = os.path.realpath(device)
+        return next((port for port in comports() if os.path.realpath(port.device) == target), None)
+
+    def _is_turing_3_5(self) -> bool:
+        """True for the official Turing 3.5", known by its USB serial number"""
+        port = self._listed_port(self.com_port)
+        return port is not None and port.serial_number == TURING_3_5_SERIAL_NUMBER
+
+    def InitializeComm(self):
+        """Detect the sub-revision with HELLO; the official Turing 3.5" never answers it, so it is set
+        directly instead of waiting for the read timeout"""
+        if self._is_turing_3_5():
+            self._set_turing_3_5()
+            logger.debug("HW sub-revision: %s (USB serial number, HELLO skipped)" % (str(self.sub_revision)))
+        else:
+            self._hello()
+
+    def SendReset(self):
+        """Send RESET and release the serial port without waiting: the display restarts on its own
+        startup screen"""
         # Reset command bypasses queue because it is run when queue threads are not yet started
         self.SendCommand(Command.RESET, 0, 0, 0, 0, bypass_queue=True)
         self.closeSerial()
-        # Wait for display reset then reconnect
-        time.sleep(5)
-        self.openSerial()
+
+    def _sleep(self, seconds: float):
+        """Sleep seconds; raises InterruptedError as soon as stop_event is set"""
+        if self.stop_event is None:
+            time.sleep(seconds)
+        elif self.stop_event.wait(seconds):
+            raise InterruptedError("stopped while waiting for the display")
+
+    def _open_when_available(self, port: str, deadline: float):
+        """Open port (detected again with AUTO, since it may change) as soon as it can be opened, trying
+        until deadline (time.monotonic()); raises SerialException after it"""
+        while True:
+            device = self.auto_detect_com_port() if self.auto_com_port else port
+            if device:
+                try:
+                    self.lcd_serial = self.open_port(device)
+                except serial.SerialException as e:
+                    error = e
+                else:
+                    self.com_port = device
+                    return
+            else:
+                error = "no display found (AUTO)"
+            if time.monotonic() > deadline:
+                raise serial.SerialException(f"cannot open the display port: {error}")
+            self._sleep(POLL_INTERVAL)
+
+    def Reset(self):
+        """Reset the display and reconnect (see the class docstring for the waits)"""
+        logger.info("Display reset (COM port may change)...")
+        port = self.com_port
+        fast = self._is_turing_3_5()
+        self.SendReset()
+        start = time.monotonic()
+        if fast:
+            while self._listed_port(port) and time.monotonic() - start < RESET_DISCONNECT_TIMEOUT:
+                self._sleep(POLL_INTERVAL)
+            fast = self._listed_port(port) is None
+        if not fast:
+            self._sleep(max(0.0, RESET_WAIT - (time.monotonic() - start)))
+        self._open_when_available(port, start + (PORT_TIMEOUT if fast else RESET_WAIT))
+        logger.debug(f"Display back on {self.com_port} after {time.monotonic() - start:.2f} s")
 
     def Clear(self):
         self.SetOrientation(Orientation.PORTRAIT)  # Bug: orientation needs to be PORTRAIT before clearing

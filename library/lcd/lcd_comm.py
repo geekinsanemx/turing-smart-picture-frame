@@ -86,6 +86,11 @@ class LcdComm(ABC):
         else:
             return self.display_width
 
+    @staticmethod
+    def open_port(device: str) -> serial.Serial:
+        """Open device with the display's serial settings; raises serial.SerialException if it cannot"""
+        return serial.Serial(device, 115200, timeout=1, rtscts=True)
+
     def openSerial(self):
         if self.com_port == 'AUTO':
             self.com_port = self.auto_detect_com_port()
@@ -102,7 +107,7 @@ class LcdComm(ABC):
             logger.debug(f"Static COM port: {self.com_port}")
 
         try:
-            self.lcd_serial = serial.Serial(self.com_port, 115200, timeout=1, rtscts=True)
+            self.lcd_serial = self.open_port(self.com_port)
         except Exception as e:
             logger.error(f"Cannot open COM port {self.com_port}: {e}")
             try:
